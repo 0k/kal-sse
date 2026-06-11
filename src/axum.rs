@@ -166,13 +166,19 @@ where
                         .data(serialize(&item.event)));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Consumer fell behind the broadcast buffer. We
-                    // cannot reconstruct the gap here; the client will
-                    // notice the dropped stream and reconnect with its
-                    // last `id:`, replaying from the retained log (or
-                    // getting a 409 -> resnapshot). Continue so a
-                    // still-valid receiver keeps flowing.
-                    continue;
+                    // Consumer fell behind the broadcast buffer: the
+                    // next `recv()` would return a LATER event,
+                    // silently skipping the gap (and `advance` would
+                    // move the cursor past it, losing those events for
+                    // this `sub_id` forever). Break instead — ending
+                    // the stream marks the handle disconnected with
+                    // its cursor UN-advanced past the gap, so the
+                    // client reconnect (same `sub_id` only — the
+                    // cursor is server-side, never sent by the client)
+                    // replays gap-free from the retained log via
+                    // `attach`, or receives `409 needs_snapshot` if
+                    // the gap fell out of the retained buffer.
+                    break;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -239,8 +245,68 @@ mod tests {
         assert_eq!(body.0["hint"], "resync via GET /api/test");
     }
 
+    #[tokio::test]
+    async fn lagged_broadcast_ends_stream_for_gap_free_resume() {
+        // SPEC: when the live broadcast lags, the subscription stream
+        // MUST end (so the client reconnects) rather than silently
+        // skip past the gap. A subsequent attach for the same `sub_id`
+        // MUST replay every missed event still retained in the log —
+        // the server-side cursor was NOT advanced past the gap.
+        use futures::StreamExt;
+
+        // channel_capacity=1 so a couple of unpolled appends overflow
+        // the receiver and force `Lagged` on the next recv().
+        let log: Arc<Mutex<EventLog<u32>>> =
+            Arc::new(Mutex::new(EventLog::new(Duration::from_secs(900), 256, 1)));
+        let (sub, epoch, backlog, live) = {
+            let mut g = log.lock().unwrap();
+            let (id, _) = g.register(None);
+            let r = g.attach(&id).unwrap();
+            (id, r.epoch, r.backlog, r.live)
+        };
+        assert!(backlog.is_empty(), "fresh register+attach has no backlog");
+
+        let stream = build_stream(log.clone(), sub.clone(), epoch, backlog, live, |e: &u32| {
+            e.to_string()
+        });
+        tokio::pin!(stream);
+
+        // Append events WITHOUT polling the stream so the capacity-1
+        // broadcast receiver falls behind.
+        {
+            let mut g = log.lock().unwrap();
+            g.append(10);
+            g.append(20);
+            g.append(30);
+            g.append(40);
+        }
+
+        // The Lagged arm MUST end the stream. With the buggy `continue`,
+        // the next recv() returns a LATER event (index 4) which the
+        // stream yields and `advance`s past — silently skipping 1..3.
+        let next = stream.next().await;
+        assert!(
+            next.is_none(),
+            "stream must end on Lagged; otherwise gap events are silently dropped",
+        );
+
+        // Reconnect with the same `sub_id` (no index — server-side
+        // cursor): the held cursor was never advanced past the gap, so
+        // `attach` replays every event still retained, gap-free.
+        let resumed = {
+            let mut g = log.lock().unwrap();
+            g.attach(&sub).unwrap()
+        };
+        let idxs: Vec<_> = resumed.backlog.iter().map(|e| e.index).collect();
+        assert_eq!(
+            idxs,
+            vec![1, 2, 3, 4],
+            "resume must replay every missed event gap-free"
+        );
+    }
+
     #[test]
-    fn expired_cursor_returns_409_with_bounds() {
+    fn expired_sub_returns_409_with_bounds() {
         let log: Arc<Mutex<EventLog<u32>>> =
             Arc::new(Mutex::new(EventLog::new(Duration::from_secs(900), 2, 64)));
         let sub = {
