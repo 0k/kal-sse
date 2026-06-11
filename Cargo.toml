@@ -23,7 +23,9 @@ exclude = [
 # `core` only by default — framework-agnostic, no HTTP types.
 default = []
 # Opt-in axum adapter (turns a `Replay` into an `axum` SSE response,
-# parses `?since` / `Last-Event-ID`, emits `409 expired_cursor`, etc.).
+# looks up the server-side cursor by `?sub=<uuid>`, emits
+# `409 needs_snapshot` on unknown / expired sub, tags events with
+# `id:`, applies keep-alive).
 axum = ["dep:axum", "dep:serde_json", "dep:async-stream", "dep:futures-core"]
 
 [dependencies]

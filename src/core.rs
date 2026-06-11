@@ -143,7 +143,7 @@ pub struct EventLog<E: Clone + Send + 'static> {
     ttl: Duration,
     /// Hard upper bound on `events.len()`. Even when a handle would pin
     /// more, the oldest events past this are dropped (such a handle
-    /// then gets [`ExpiredCursor`] on resume — a deliberate safety
+    /// then gets [`AttachError::Expired`] on resume — a deliberate safety
     /// valve against unbounded memory from a stuck subscriber).
     max_events: usize,
 }
@@ -321,7 +321,8 @@ impl<E: Clone + Send + 'static> EventLog<E> {
 
     /// Mark a subscription's stream as disconnected: start its TTL
     /// countdown (`now + ttl`) so a reconnect within the window resumes
-    /// gap-free, after which [`compact`] may reclaim it. No-op for an
+    /// gap-free, after which [`compact`](Self::compact) may reclaim
+    /// it. No-op for an
     /// unknown `sub_id` or a stale `epoch` (a superseded stream ending
     /// must NOT start a TTL on the handle that replaced it).
     pub fn disconnect(&mut self, sub_id: &str, epoch: Epoch, now: Instant) {
@@ -360,7 +361,7 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         }
 
         // Hard cap (safety valve) — a handle pinning more than
-        // `max_events` will get `ExpiredCursor` on resume.
+        // `max_events` will get `AttachError::Expired` on resume.
         while self.events.len() > self.max_events {
             self.events.pop_front();
         }
