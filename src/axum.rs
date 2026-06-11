@@ -1,0 +1,275 @@
+//! `axum` adapter (feature `axum`).
+//!
+//! Renders a [`crate::core::EventLog`] subscription onto the SSE wire:
+//!
+//! * looks up the subscription's resume cursor by `sub_id` — the
+//!   cursor is server-side state (set by the REST snapshot via
+//!   [`EventLog::register`](crate::core::EventLog::register), then
+//!   advanced on every delivered event), so the SSE request carries
+//!   ONLY `?sub=<uuid>`, never an index,
+//! * atomically replays the backlog then attaches to live,
+//! * tags every event with `id: <index>` (diagnostic / parity with the
+//!   SSE spec; the client does not need to echo it back),
+//! * **advances the subscription's server-side cursor as each event is
+//!   delivered** (the heart of the contract),
+//! * marks the subscription disconnected when the stream drops (starts
+//!   its TTL grace),
+//! * answers `409 needs_snapshot` when the `sub_id` is unknown or its
+//!   cursor fell out of the retained window,
+//! * keeps the connection warm with a 15 s `: ping` comment.
+//!
+//! The caller owns the `Arc<Mutex<EventLog<E>>>` and provides a
+//! `serialize` closure (`&E -> String`) so this crate stays free of any
+//! `serde` assumption about the event type.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::Json;
+use futures_core::Stream;
+
+use crate::core::{AttachError, EventLog, Indexed, SubId};
+
+/// Default keep-alive interval. Matches vigil-watch's existing streams.
+const KEEPALIVE_SECS: u64 = 15;
+
+/// Header carrying the snapshot's cursor on a REST snapshot response.
+/// Informational: the client does NOT need to send it back (the server
+/// keys the cursor by `sub_id`), but it is useful for debugging and for
+/// non-`kal-sse` consumers.
+pub const SNAPSHOT_INDEX_HEADER: &str = "x-snapshot-index";
+
+/// Header / query name carrying the subscription id on an SSE request.
+pub const SUB_ID_PARAM: &str = "sub";
+
+/// The `409 Conflict` body returned when a subscription cannot resume
+/// (unknown `sub_id` or its cursor expired). The client must re-take
+/// the REST snapshot to (re)register and obtain a fresh subscription.
+fn needs_snapshot_body(
+    sub_id: &str,
+    err: AttachError,
+    resync_hint: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut body = serde_json::json!({
+        "error": "needs_snapshot",
+        "sub": sub_id,
+        "hint": resync_hint,
+    });
+    if let AttachError::Expired { earliest, current } = err {
+        body["earliest"] = serde_json::json!(earliest);
+        body["current"] = serde_json::json!(current);
+    }
+    (StatusCode::CONFLICT, Json(body))
+}
+
+/// Build a resilient SSE response for a subscription to `log`.
+///
+/// * `log` — the shared event log behind the channel.
+/// * `sub_id` — the subscription id from the SSE request (`?sub=<uuid>`).
+///   It must already have been registered by the REST snapshot
+///   ([`EventLog::register`](crate::core::EventLog::register)).
+/// * `serialize` — turns one event into its SSE `data:` payload.
+/// * `resync_hint` — human-readable pointer to the snapshot endpoint,
+///   embedded in the `409` body (e.g. `"resync via GET /api/projects"`).
+///
+/// On success returns an [`Sse`] streaming the backlog then live
+/// updates; on an unknown / expired subscription returns the `409`
+/// tuple so the caller can `?`-propagate it as an axum response.
+#[allow(clippy::type_complexity)]
+pub fn sse_response<E, F>(
+    log: Arc<Mutex<EventLog<E>>>,
+    sub_id: SubId,
+    serialize: F,
+    resync_hint: &str,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<serde_json::Value>),
+>
+where
+    E: Clone + Send + 'static,
+    F: Fn(&E) -> String + Send + 'static,
+{
+    let replay = {
+        let mut guard = log.lock().expect("event log mutex poisoned");
+        match guard.attach(&sub_id) {
+            Ok(r) => r,
+            Err(err) => {
+                return Err(needs_snapshot_body(&sub_id, err, resync_hint));
+            }
+        }
+    };
+
+    let epoch = replay.epoch;
+    let stream = build_stream(log, sub_id, epoch, replay.backlog, replay.live, serialize);
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(KEEPALIVE_SECS))
+            .text("ping"),
+    ))
+}
+
+/// Internal: chain the backlog stream then the live stream, advancing
+/// the subscription cursor on every delivered event and marking it
+/// disconnected when the live stream ends.
+///
+/// `epoch` is this attach's generation: if a later attach supersedes
+/// this `sub_id` (the client re-subscribed to the same data flow), the
+/// stream stops as soon as it notices it is no longer current, and its
+/// final `disconnect` is gated on the epoch so it cannot clobber the
+/// replacement handle.
+fn build_stream<E, F>(
+    log: Arc<Mutex<EventLog<E>>>,
+    sub_id: SubId,
+    epoch: crate::core::Epoch,
+    backlog: Vec<Indexed<E>>,
+    live: tokio::sync::broadcast::Receiver<Indexed<E>>,
+    serialize: F,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>>
+where
+    E: Clone + Send + 'static,
+    F: Fn(&E) -> String + Send + 'static,
+{
+    use async_stream::stream;
+
+    stream! {
+        let serialize = serialize;
+        // 1) Replay the backlog. Each delivered item advances the
+        //    subscription cursor so compaction can release it.
+        for item in backlog {
+            {
+                let mut g = log.lock().expect("event log mutex poisoned");
+                g.advance(&sub_id, epoch, item.index);
+            }
+            yield Ok(Event::default()
+                .id(item.index.to_string())
+                .data(serialize(&item.event)));
+        }
+
+        // 2) Live tail.
+        let mut live = live;
+        loop {
+            match live.recv().await {
+                Ok(item) => {
+                    // Stop immediately if a newer attach superseded us.
+                    {
+                        let mut g = log.lock().expect("event log mutex poisoned");
+                        if !g.is_current(&sub_id, epoch) {
+                            break;
+                        }
+                        g.advance(&sub_id, epoch, item.index);
+                    }
+                    yield Ok(Event::default()
+                        .id(item.index.to_string())
+                        .data(serialize(&item.event)));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Consumer fell behind the broadcast buffer. We
+                    // cannot reconstruct the gap here; the client will
+                    // notice the dropped stream and reconnect with its
+                    // last `id:`, replaying from the retained log (or
+                    // getting a 409 -> resnapshot). Continue so a
+                    // still-valid receiver keeps flowing.
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+
+        // 3) Stream ended (client gone / server shutdown / superseded):
+        //    start the disconnect TTL so a reconnect within the grace
+        //    window resumes gap-free. Epoch-gated: a superseded stream
+        //    must NOT start a TTL on the handle that replaced it.
+        {
+            let mut g = log.lock().expect("event log mutex poisoned");
+            g.disconnect(&sub_id, epoch, Instant::now());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn attach_after_register_returns_sse() {
+        let log: Arc<Mutex<EventLog<u32>>> =
+            Arc::new(Mutex::new(EventLog::new(Duration::from_secs(900), 256, 64)));
+        let sub = {
+            let mut g = log.lock().unwrap();
+            g.append(10);
+            // REST snapshot registers the subscription at the current
+            // cursor, returning the (minted) sub_id.
+            let (id, _cursor) = g.register(None);
+            id
+        };
+        let res = sse_response(
+            log,
+            sub,
+            |e: &u32| e.to_string(),
+            "resync via GET /api/test",
+        );
+        assert!(res.is_ok(), "registered sub should produce an SSE response");
+    }
+
+    #[test]
+    fn unknown_sub_returns_409_needs_snapshot() {
+        let log: Arc<Mutex<EventLog<u32>>> =
+            Arc::new(Mutex::new(EventLog::new(Duration::from_secs(900), 256, 64)));
+        {
+            let mut g = log.lock().unwrap();
+            g.append(1);
+        }
+        // Never registered this sub_id.
+        let res = sse_response(
+            log,
+            "never-registered".to_string(),
+            |e: &u32| e.to_string(),
+            "resync via GET /api/test",
+        );
+        let (status, body) = match res {
+            Ok(_) => panic!("expected 409 needs_snapshot"),
+            Err(t) => t,
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["error"], "needs_snapshot");
+        assert_eq!(body.0["sub"], "never-registered");
+        assert_eq!(body.0["hint"], "resync via GET /api/test");
+    }
+
+    #[test]
+    fn expired_cursor_returns_409_with_bounds() {
+        let log: Arc<Mutex<EventLog<u32>>> =
+            Arc::new(Mutex::new(EventLog::new(Duration::from_secs(900), 2, 64)));
+        let sub = {
+            let mut g = log.lock().unwrap();
+            g.append(1);
+            // Register at cursor 1...
+            let (id, _) = g.register(None);
+            // ...then append past the hard cap so the registered cursor
+            // (1) falls behind the retained window (earliest becomes 2).
+            g.append(2);
+            g.append(3);
+            g.append(4); // cap=2 -> earliest now 3
+            id
+        };
+        let res = sse_response(
+            log,
+            sub,
+            |e: &u32| e.to_string(),
+            "resync via GET /api/test",
+        );
+        let (status, body) = match res {
+            Ok(_) => panic!("expected 409 needs_snapshot (expired)"),
+            Err(t) => t,
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["error"], "needs_snapshot");
+        // earliest retained = 3, current = last_index = 4.
+        assert_eq!(body.0["earliest"], 3);
+        assert_eq!(body.0["current"], 4);
+        assert_eq!(body.0["hint"], "resync via GET /api/test");
+    }
+}

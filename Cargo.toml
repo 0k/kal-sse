@@ -1,0 +1,39 @@
+[package]
+name = "kal-sse"
+version = "0.1.0"
+edition = "2021"
+authors = ["Valentin Lab <valentin.lab@kalysto.org>"]
+description = "Resilient Server-Sent Events: snapshot + cursor data channels with gap-free reconnect"
+license = "MIT"
+repository = "https://github.com/0k/kal-sse"
+readme = "README.md"
+keywords = ["sse", "event-stream", "resilient", "cursor", "snapshot"]
+categories = ["web-programming", "asynchronous"]
+exclude = [
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CHANGELOG.rst",
+    "README.org",
+    "autogen.sh",
+    ".gitchangelog.rc",
+    ".gitignore",
+]
+
+[features]
+# `core` only by default — framework-agnostic, no HTTP types.
+default = []
+# Opt-in axum adapter (turns a `Replay` into an `axum` SSE response,
+# parses `?since` / `Last-Event-ID`, emits `409 expired_cursor`, etc.).
+axum = ["dep:axum", "dep:serde_json", "dep:async-stream", "dep:futures-core"]
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+axum = { version = "0.8", optional = true }
+serde_json = { version = "1", optional = true }
+async-stream = { version = "0.3", optional = true }
+futures-core = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+futures = "0.3"
