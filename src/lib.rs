@@ -26,25 +26,118 @@
 //! still need, and no more.
 //!
 //! When a subscription's SSE stream drops, the server keeps its handle
-//! for a TTL (default 15 min). A reconnect with the same `sub_id` and
-//! the cursor the client still holds (`?since=N`) resumes **gap-free**:
-//! the server replays `N+1..` then attaches to live. Only when `N` has
+//! for a TTL (default 15 min). A reconnect with the same `sub_id`
+//! (carrying no index — the cursor lives on the server) resumes
+//! **gap-free**: the server replays from the cursor it still holds for
+//! that `sub_id`, then attaches to live. Only when that cursor has
 //! fallen out of the retained buffer (TTL lapsed AND compaction moved
-//! past it) does the server answer [`ExpiredCursor`], and the client
-//! re-snapshots.
+//! past it) does the server answer [`AttachError::Expired`], and the
+//! client re-snapshots.
 //!
 //! # Layers
 //!
 //! * [`core`] — framework-agnostic. The [`EventLog`] data structure,
 //!   the subscription registry, cursor advancement, compaction, and the
-//!   [`ExpiredCursor`] error. No HTTP, no axum, no `serde`.
+//!   [`AttachError`] error. No HTTP, no axum, no `serde`.
 //! * `axum` (feature `axum`) — a thin adapter turning a channel
-//!   subscription into an `axum` SSE response: `?since` / `Last-Event-ID`
-//!   parsing, `409 expired_cursor`, the `id:` field, `x-snapshot-index`,
-//!   and keep-alive.
+//!   subscription into an `axum` SSE response: `?sub=<uuid>` lookup of
+//!   the server-side cursor, `409 needs_snapshot` on unknown / expired
+//!   sub, the `id:` field, the `x-snapshot-index` header constant, and
+//!   keep-alive.
 //!
 //! The core never depends on the adapter; the adapter is opt-in so the
 //! data structure stays reusable outside any web framework.
+//!
+//! # Wire exchange
+//!
+//! Happy path (first connect) and gap-free reconnect in one diagram:
+//!
+//! ```text
+//! Client                              Server
+//!   |                                   |
+//!   |  GET /api/things                  |
+//!   |---------------------------------->|
+//!   |                                   | register(None) -> ("3f2a…", 42)
+//!   |  200 OK                           |
+//!   |  x-snapshot-index: 42             |
+//!   |  { …body…, sub: "3f2a…" }         |
+//!   |<----------------------------------|
+//!   |                                   |
+//!   |  GET /api/things/stream?sub=3f2a… |
+//!   |---------------------------------->|
+//!   |                                   | attach("3f2a…") -> backlog, live
+//!   |  200 OK (SSE stream)              |
+//!   |<----------------------------------|
+//!   |  id: 43 / data: {…}              | advance(…, 43)
+//!   |<----------------------------------|
+//!   |  : ping                           |  (every 15 s)
+//!   |<----------------------------------|
+//!   |                                   |
+//!   |  [network drop]                   |
+//!   |  X---------------------------------| disconnect(…, epoch, now)
+//!   |                                   |   TTL countdown starts
+//!   |                                   |   (events 44, 45 appended)
+//!   |                                   |
+//!   |  GET /api/things/stream?sub=3f2a… |  (same sub_id, no index)
+//!   |---------------------------------->|
+//!   |                                   | attach("3f2a…") -> backlog=[44,45]
+//!   |  200 OK (SSE stream)              |
+//!   |<----------------------------------|
+//!   |  id: 44 / data: {…}              | advance(…, 44)
+//!   |  id: 45 / data: {…}              | advance(…, 45)
+//!   |<----------------------------------|
+//!   |  (live tail continues…)           |
+//!   |                                   |
+//!   |  [TTL lapsed / server restart]    |
+//!   |  GET /api/things/stream?sub=3f2a… |
+//!   |---------------------------------->|
+//!   |                                   | attach("3f2a…") -> UnknownSub
+//!   |  409 Conflict                     |
+//!   |  {"error":"needs_snapshot",…}     |
+//!   |<----------------------------------|
+//!   |  GET /api/things?sub=3f2a…        |  (propose same sub_id)
+//!   |---------------------------------->|
+//!   |                                   | register(Some("3f2a…")) -> (…, 51)
+//!   |  200 OK / x-snapshot-index: 51    |
+//!   |<----------------------------------|
+//!   |  GET /api/things/stream?sub=3f2a… |
+//!   |---------------------------------->|
+//!   |  200 OK (SSE stream from 51)      |
+//!   |<----------------------------------|
+//! ```
+//!
+//! # Client contract
+//!
+//! This is a cooperating-client protocol. A native browser `EventSource`
+//! is not sufficient: per the WHATWG spec, any non-200 response
+//! (including the `409`) permanently closes the connection with no
+//! retry and no status code in the error event. The client must wrap
+//! `EventSource` or use a fetch-based SSE reader.
+//!
+//! Client loop:
+//!
+//! 1. `GET` snapshot endpoint (optionally proposing a stored `sub_id`).
+//!    Render the body as current state. Store the returned `sub_id`.
+//! 2. Open SSE: `GET <stream>?sub=<sub_id>`.
+//! 3. Apply each event in order. (`id:` is diagnostic; do not echo it.)
+//! 4. On stream drop: reconnect with the same `sub_id` (step 2).
+//!    Within TTL → gap-free resume.
+//! 5. On `409 needs_snapshot`: go to step 1, proposing the same `sub_id`.
+//!
+//! The client never tracks or sends an index. The server holds the cursor.
+//!
+//! # Limits
+//!
+//! * **In-memory, single-process.** A server restart loses the registry.
+//!   Every client gets `409 needs_snapshot` on its next SSE request and
+//!   re-takes the snapshot (handled by design; thundering-herd on restart
+//!   is the cost).
+//! * **Not horizontally scalable as-is.** The registry is process-local;
+//!   no shared-store backend is provided.
+//! * **Slowest handle pins the buffer.** The retention floor is the
+//!   minimum cursor over all live and within-TTL handles. The
+//!   `max_events` hard cap is the escape valve: once hit, the lagging
+//!   subscriber gets `AttachError::Expired` on resume.
 
 #![forbid(unsafe_code)]
 

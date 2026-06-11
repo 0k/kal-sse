@@ -5,57 +5,423 @@ gap-free reconnect.
 
 * What it is
 
-A *data channel* pairs a REST snapshot with an SSE update stream:
+A *data channel* pairs a REST snapshot with an SSE update stream. The
+snapshot establishes the client's starting position, and the stream
+delivers every subsequent update in order. A *subscription id*
+(=sub_id=, a UUID) ties the two together: the client proposes or
+receives one at snapshot time and carries it on every SSE request.
 
-- the REST snapshot establishes the client's starting position — a
-  monotonic cursor index =N= on the channel;
-- the SSE stream then delivers every update after =N=, in order, each
-  tagged with its own index so the client always knows where it is.
+The cursor lives *only on the server*, keyed by =sub_id=. The client
+never sends an index. When the stream drops, the server holds the
+resume point for a configurable TTL; a reconnect with the same
+=sub_id= replays the gap and continues live. If the TTL lapses or the
+server restarts, the client gets a =409 needs_snapshot= and re-takes
+the snapshot.
 
-A client identifies itself to one or more channel with a *subscription id*
-(=sub_id=) — one per logical subscription to one data flow.
+* Why not plain SSE?
 
-* Why "resilient"
+The WHATWG SSE spec's resilience primitives are entirely client-side:
+the =id:= field populates =Last-Event-ID= on automatic reconnects, and
+=retry:= sets the reconnect delay. The spec imposes *zero* server-side
+buffering or replay obligations. Gap-free delivery is entirely the
+application's problem.
 
-The cursor is *delivery-driven*: sending the =N -> N+1= event /is/ the
-state transfer. Once the server has emitted that event to a
-subscription, the subscription is authoritatively at =N+1= — no ack,
-no heartbeat, no re-snapshot. This lets the server retain exactly the
-events some live subscription might still need, and no more.
+The naive Rust/axum pattern hands each new connection a fresh
+=tokio::broadcast::Receiver= and wraps it in =Sse::new(...)=. This
+silently loses every event published while the client was
+disconnected, and a lagged receiver skips events without warning. That
+is the bug class =kal-sse= exists to kill.
 
-When a subscription's stream drops, the server keeps its handle for a
-TTL. A reconnect with the same =sub_id= and the cursor the client
-still holds (=?since=N=) resumes *gap-free*: the server replays =N+1..=
-then attaches to live. Only when =N= has fallen out of the retained
-buffer does the server answer =409 expired_cursor=, and the client
-re-snapshots.
+A second, subtler bug class: designs that pin a resume point at
+snapshot time and expire it on wall-clock TTL will expire a
+long-lived *connected* client mid-stream. In =kal-sse= only
+*disconnected* handles age out via TTL. A live subscription is never
+reclaimed regardless of how much time passes.
 
-* Layers
+** Design lineage
 
-- =core= — framework-agnostic. The =EventLog<E>= data structure, the
-  subscription registry, cursor advancement, compaction, and the
-  =ExpiredCursor= error. No HTTP, no axum, no =serde=.
-- =axum= (feature =axum=) — a thin adapter turning a channel
-  subscription into an =axum= SSE response: =?since= / =Last-Event-ID=
-  parsing, =409 expired_cursor=, the =id:= field, =x-snapshot-index=,
-  and keep-alive.
+Client-held-cursor designs exist: =Last-Event-ID= in Mercure,
+=?offset=N= in stateless offset-based protocols. =kal-sse= deliberately
+inverts this, keeping the cursor server-side keyed by an opaque
+=sub_id= (similar in spirit to GraphQL-SSE's reservation token). The
+trade-off: the simplest possible client (carries only a UUID) at the
+cost of server statefulness (an in-memory registry per channel).
 
-The core never depends on the adapter; the adapter is opt-in so the
-data structure stays reusable outside any web framework.
+* The protocol
 
-* Usage
+A subscription's lifecycle has three phases:
 
-Add to =Cargo.toml=:
+1. *Snapshot* (REST GET). The client optionally proposes a =sub_id=
+   it already holds. The server mints one if none is proposed, or
+   adopts the proposed id and supersedes any prior handle for it.
+   =register= pins the cursor at the current =last_index= and returns
+   the effective =sub_id= plus that index in the =x-snapshot-index=
+   response header. The client renders the snapshot body as its
+   initial state.
 
-#+begin_src toml
-[dependencies]
-kal-sse = { version = "0.1", features = ["axum"] }
+2. *Stream* (SSE GET =?sub=<uuid>=). The server looks up the
+   server-side cursor for that =sub_id=, atomically replays any events
+   appended since the snapshot, then attaches to the live broadcast.
+   Every delivered event advances the cursor. The client applies
+   events in order; it never needs to track or echo indices.
+
+3. *Reconnect or re-snapshot*. On stream drop the client reconnects
+   with the same =sub_id=. Within the TTL the server replays from the
+   held cursor, gap-free. After the TTL (or on server restart) the
+   server answers =409 needs_snapshot= and the client goes back to
+   step 1, proposing the same =sub_id= so the server supersedes the
+   stale handle rather than leaking a new one.
+
+* Wire exchanges
+
+** Scenario A: first subscription
+
+#+begin_example
+Client                              Server
+  |                                   |
+  |  GET /api/things                  |
+  |---------------------------------->|
+  |                                   | register(None)
+  |                                   |   mints sub_id "3f2a…"
+  |                                   |   pins cursor at last_index = 42
+  |  200 OK                           |
+  |  x-snapshot-index: 42             |
+  |  { …snapshot body…, sub: "3f2a…" }|
+  |<----------------------------------|
+  |                                   |
+  |  (client stores sub_id "3f2a…")   |
+  |                                   |
+  |  GET /api/things/stream?sub=3f2a… |
+  |---------------------------------->|
+  |                                   | attach("3f2a…")
+  |                                   |   subscribes to broadcast FIRST
+  |                                   |   reads backlog since cursor 42
+  |                                   |   (empty — no events yet)
+  |                                   |   epoch bumped to 1
+  |  200 OK (SSE stream open)         |
+  |<----------------------------------|
+  |                                   |
+  |  (server appends event 43)        |
+  |                                   | advance("3f2a…", epoch=1, 43)
+  |  id: 43                           |
+  |  data: {"kind":"update",…}        |
+  |<----------------------------------|
+  |                                   |
+  |  (server appends event 44)        |
+  |                                   | advance("3f2a…", epoch=1, 44)
+  |  id: 44                           |
+  |  data: {"kind":"update",…}        |
+  |<----------------------------------|
+  |                                   |
+  |  : ping                           |  (every 15 s)
+  |<----------------------------------|
+#+end_example
+
+The backlog replay and live-attach happen atomically under the same
+lock, so no event can slip between the last replayed index and the
+first live one.
+
+** Scenario B: transient disconnect and gap-free resume
+
+#+begin_example
+Client                              Server
+  |                                   |
+  |  (stream open, cursor at 44)      |
+  |                                   |
+  |  [network drop]                   |
+  |  X---------------------------------|
+  |                                   | disconnect("3f2a…", epoch=1, now)
+  |                                   |   TTL countdown starts
+  |                                   |
+  |  (server appends events 45, 46)   |
+  |                                   | cursor still held at 44
+  |                                   |
+  |  GET /api/things/stream?sub=3f2a… |
+  |---------------------------------->|
+  |                                   | attach("3f2a…")
+  |                                   |   cursor = 44 (server-held)
+  |                                   |   backlog = [45, 46]
+  |                                   |   epoch bumped to 2
+  |  200 OK (SSE stream open)         |
+  |<----------------------------------|
+  |                                   |
+  |  id: 45                           | advance("3f2a…", epoch=2, 45)
+  |  data: {…}                        |
+  |<----------------------------------|
+  |  id: 46                           | advance("3f2a…", epoch=2, 46)
+  |  data: {…}                        |
+  |<----------------------------------|
+  |  (live tail continues…)           |
+#+end_example
+
+The client sent no index. The server knew where to resume because it
+held the cursor for =3f2a…= across the disconnect.
+
+** Scenario C: resume failure and re-snapshot
+
+#+begin_example
+Client                              Server
+  |                                   |
+  |  [disconnected for > TTL,         |
+  |   or server restarted]            |
+  |                                   | compact() reclaimed "3f2a…"
+  |                                   |   (or in-memory state lost)
+  |                                   |
+  |  GET /api/things/stream?sub=3f2a… |
+  |---------------------------------->|
+  |                                   | attach("3f2a…") -> UnknownSub
+  |  409 Conflict                     |
+  |  { "error": "needs_snapshot",     |
+  |    "sub": "3f2a…",                |
+  |    "hint": "GET /api/things" }    |
+  |<----------------------------------|
+  |                                   |
+  |  GET /api/things?sub=3f2a…        |  (proposes same sub_id)
+  |---------------------------------->|
+  |                                   | register(Some("3f2a…"))
+  |                                   |   supersedes any stale handle
+  |                                   |   pins cursor at last_index = 51
+  |  200 OK                           |
+  |  x-snapshot-index: 51             |
+  |  { …fresh snapshot…, sub: "3f2a…" }
+  |<----------------------------------|
+  |                                   |
+  |  GET /api/things/stream?sub=3f2a… |
+  |---------------------------------->|
+  |  200 OK (SSE stream open)         |
+  |<----------------------------------|
+  |  (live tail from 51…)             |
+#+end_example
+
+The client proposes the same =sub_id= it already held. The server
+supersedes the stale handle (if any) rather than leaking a new one.
+The client's stored =sub_id= stays valid across re-snapshots.
+
+If the cursor fell out of the retained buffer (hard-cap eviction
+rather than TTL), the =409= body also carries =earliest= and =current=
+fields for diagnostics.
+
+** Scenario D: supersede race
+
+#+begin_example
+Client (tab A)   Client (tab B)          Server
+  |                  |                     |
+  |  (stream open,   |                     |
+  |   epoch=1)       |                     |
+  |                  |  GET /api/things    |
+  |                  |-------------------->|
+  |                  |                     | register(Some("3f2a…"))
+  |                  |                     |   epoch bumped to 2
+  |                  |  200 OK             |
+  |                  |<--------------------|
+  |                  |  GET …?sub=3f2a…    |
+  |                  |-------------------->|
+  |                  |                     | attach("3f2a…") -> epoch=3
+  |                  |                     | is_current("3f2a…", 1) = false
+  |  [stream ends]   |                     |   tab A's stream terminated
+  |<-----------------X                     |
+  |                  |  200 OK (stream)    |
+  |                  |<--------------------|
+  |                  |  (authoritative)    |
+#+end_example
+
+At most one live attach per =sub_id= is ever authoritative. The
+superseded stream's =advance= and =disconnect= calls become no-ops so
+they cannot corrupt the replacement handle.
+
+* Client requirements
+
+=kal-sse= is a *cooperating-client* protocol. A native browser
+=EventSource= is not sufficient on its own: per the WHATWG spec, any
+non-200 response (including the =409=) permanently fails the connection
+(=readyState CLOSED=, no retry, error event carries no status code).
+The client must wrap =EventSource= or use a fetch-based SSE reader so
+it can inspect the HTTP status and act accordingly.
+
+** Client loop
+
+#+begin_example
+1. GET snapshot endpoint (optionally proposing a stored sub_id).
+   Render the response body as current state.
+   Store the returned sub_id.
+
+2. Open SSE: GET <stream>?sub=<sub_id>
+
+3. On each event: apply it in order.
+   (The id: field is diagnostic; the client need not echo it.)
+
+4. On stream drop: reconnect with the same sub_id (step 2).
+   Within TTL -> gap-free resume.
+
+5. On 409 needs_snapshot: go to step 1.
+   Propose the same sub_id so the server supersedes the stale handle.
+#+end_example
+
+The client never tracks or sends an index. The server holds the cursor.
+
+* Server usage
+
+#+begin_src rust
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::extract::{Query, State};
+use axum::http::HeaderMap;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Router;
+use kal_sse::axum::{sse_response, SNAPSHOT_INDEX_HEADER, SUB_ID_PARAM};
+use kal_sse::core::EventLog;
+use serde::Deserialize;
+use tokio::time;
+
+#[derive(Clone)]
+struct AppState {
+    log: Arc<Mutex<EventLog<String>>>,
+}
+
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    sub: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    sub: String,
+}
+
+async fn snapshot(
+    State(state): State<AppState>,
+    Query(q): Query<SnapshotQuery>,
+) -> impl IntoResponse {
+    let (sub_id, cursor) = state.log.lock().unwrap().register(q.sub);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        SNAPSHOT_INDEX_HEADER,
+        cursor.to_string().parse().unwrap(),
+    );
+    // Return headers + snapshot body (abbreviated here).
+    (headers, format!("{{\"sub\":\"{sub_id}\"}}"))
+}
+
+async fn stream(
+    State(state): State<AppState>,
+    Query(q): Query<StreamQuery>,
+) -> impl IntoResponse {
+    sse_response(
+        state.log.clone(),
+        q.sub,
+        |e: &String| e.clone(),
+        "resync via GET /api/things",
+    )
+}
+
+#[tokio::main]
+async fn main() {
+    let log = Arc::new(Mutex::new(EventLog::<String>::new(
+        Duration::from_secs(900), // disconnect TTL
+        10_000,                   // max retained events
+        256,                      // broadcast channel capacity
+    )));
+
+    // Periodic compaction: reclaim expired handles, trim the buffer.
+    let compact_log = log.clone();
+    tokio::spawn(async move {
+        let mut tick = time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            compact_log
+                .lock()
+                .unwrap()
+                .compact(std::time::Instant::now());
+        }
+    });
+
+    // Appender (example: append from some external source).
+    let append_log = log.clone();
+    tokio::spawn(async move {
+        let mut tick = time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            append_log
+                .lock()
+                .unwrap()
+                .append("hello".to_string());
+        }
+    });
+
+    let state = AppState { log };
+    let app = Router::new()
+        .route("/api/things", get(snapshot))
+        .route("/api/things/stream", get(stream))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
 #+end_src
 
-Server side: hold an =Arc<Mutex<EventLog<E>>>= per channel, =append=
-events to it, =compact= on a periodic tick, and serve the SSE endpoint
-through =kal_sse::axum::sse_response=. The REST snapshot endpoint hands
-out =EventLog::last_index= via the =x-snapshot-index= header.
+Key points:
+
+- One =Arc<Mutex<EventLog<E>>>= per channel. Events must be
+  =Clone + Send + 'static=.
+- The snapshot handler calls =register= and echoes the cursor in the
+  =x-snapshot-index= header. The client does not need to send it back.
+- The SSE handler calls =sse_response=, which handles backlog replay,
+  cursor advancement, keep-alive, and the =409= response.
+- The =serialize= closure converts your event type to a =data:= string.
+  The crate has no =serde= dependency.
+- Call =compact= on a periodic tick to reclaim expired handles and trim
+  the buffer.
+
+* Retention and memory
+
+The buffer retains every event with index strictly greater than the
+lowest cursor held by any live or within-TTL handle. This is the
+*cursor frontier*: the server keeps exactly what some subscriber might
+still need to replay, and nothing more.
+
+Two safety valves bound memory:
+
+- *TTL* (constructor parameter, e.g. 15 min): a disconnected handle
+  is reclaimed by =compact= after this window. Once reclaimed, the
+  events it was pinning can be dropped (unless another handle still
+  needs them).
+- *=max_events=* (constructor parameter): a hard cap on the retained
+  buffer. If the buffer would exceed this, the oldest events are
+  dropped immediately. Any handle whose cursor falls behind the
+  resulting window gets =AttachError::Expired= on the next attach and
+  must re-snapshot. This is a deliberate safety valve against a single
+  stuck subscriber consuming unbounded memory.
+
+On broadcast lag (a live subscriber's =tokio::broadcast= receiver falls
+behind the channel capacity), the adapter *ends the stream* rather
+than skipping events. The cursor is left un-advanced past the gap, so
+the client's reconnect replays gap-free from the retained log. If the
+gap fell out of the retained buffer, the client gets =409
+needs_snapshot=.
+
+* Scope and limits
+
+- *In-memory, single-process.* The subscription registry is not
+  persisted. A server restart loses all handles: every client gets
+  =409 needs_snapshot= on its next SSE request and re-takes the
+  snapshot. This is handled by design, but a thundering herd of
+  simultaneous re-snapshots on restart is the cost.
+
+- *Not horizontally scalable as-is.* The registry is process-local.
+  Running multiple instances behind a load balancer requires a shared
+  store backend, which this crate does not provide.
+
+- *Slowest handle pins the buffer.* The cursor frontier is the minimum
+  over all live and within-TTL handles. A single slow or stuck
+  subscriber holds the buffer for everyone. The =max_events= cap is
+  the escape valve: once hit, the stuck subscriber gets =409= on
+  resume and the buffer is freed.
+
+- *One =EventLog= per channel.* Events must be =Clone + Send + 'static=.
+  The adapter is serde-free: the caller provides a =serialize: Fn(&E)
+  -> String= closure.
 
 * License
 
