@@ -12,6 +12,8 @@
 //!   SSE spec; the client does not need to echo it back),
 //! * **advances the subscription's server-side cursor as each event is
 //!   delivered** (the heart of the contract),
+//! * opens the response body immediately with a comment that carries no
+//!   data or event id and does not advance the subscription cursor,
 //! * marks the subscription disconnected when the stream drops (starts
 //!   its TTL grace),
 //! * answers `409 needs_snapshot` when the `sub_id` is unknown or its
@@ -111,9 +113,10 @@ where
     ))
 }
 
-/// Internal: chain the backlog stream then the live stream, advancing
-/// the subscription cursor on every delivered event and marking it
-/// disconnected when the live stream ends.
+/// Internal: open with an immediate comment, then chain the backlog
+/// stream and live stream, advancing the subscription cursor on every
+/// delivered event and marking it disconnected when the live stream
+/// ends.
 ///
 /// `epoch` is this attach's generation: if a later attach supersedes
 /// this `sub_id` (the client re-subscribed to the same data flow), the
@@ -136,6 +139,8 @@ where
 
     stream! {
         let serialize = serialize;
+        yield Ok(Event::default().comment("connected"));
+
         // 1) Replay the backlog. Each delivered item advances the
         //    subscription cursor so compaction can release it.
         for item in backlog {
@@ -198,6 +203,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn immediate_comment_precedes_backlog_without_advancing_cursor() {
+        use axum::response::IntoResponse;
+        use futures::StreamExt;
+
+        let log: Arc<Mutex<EventLog<u32>>> =
+            Arc::new(Mutex::new(EventLog::new(Duration::from_secs(900), 256, 64)));
+        let sub = {
+            let mut g = log.lock().unwrap();
+            let (id, _) = g.register(None);
+            g.append(10);
+            g.append(20);
+            g.append(30);
+            id
+        };
+
+        let response = sse_response(
+            log.clone(),
+            sub.clone(),
+            |e: &u32| e.to_string(),
+            "resync via GET /api/test",
+        )
+        .unwrap()
+        .into_response();
+        let mut body = response.into_body().into_data_stream();
+
+        let first = body.next().await.unwrap().unwrap();
+        assert_eq!(&first[..], b": connected\n\n");
+        drop(body);
+
+        // Consuming only the comment must not advance the cursor. A
+        // reconnect therefore still receives the complete backlog.
+        let resumed = sse_response(
+            log,
+            sub,
+            |e: &u32| e.to_string(),
+            "resync via GET /api/test",
+        )
+        .unwrap()
+        .into_response();
+        let mut resumed_body = resumed.into_body().into_data_stream();
+
+        assert_eq!(
+            &resumed_body.next().await.unwrap().unwrap()[..],
+            b": connected\n\n"
+        );
+        assert_eq!(
+            &resumed_body.next().await.unwrap().unwrap()[..],
+            b"id: 1\ndata: 10\n\n"
+        );
+        assert_eq!(
+            &resumed_body.next().await.unwrap().unwrap()[..],
+            b"id: 2\ndata: 20\n\n"
+        );
+        assert_eq!(
+            &resumed_body.next().await.unwrap().unwrap()[..],
+            b"id: 3\ndata: 30\n\n"
+        );
+    }
 
     #[tokio::test]
     async fn attach_after_register_returns_sse() {
@@ -281,9 +346,17 @@ mod tests {
             g.append(40);
         }
 
-        // The Lagged arm MUST end the stream. With the buggy `continue`,
-        // the next recv() returns a LATER event (index 4) which the
-        // stream yields and `advance`s past — silently skipping 1..3.
+        // The immediate comment is the first item and does not poll the
+        // lagged receiver or advance the cursor.
+        assert!(
+            stream.next().await.is_some(),
+            "stream must start with the immediate comment"
+        );
+
+        // The Lagged arm MUST then end the stream. With the buggy
+        // `continue`, the next recv() returns a LATER event (index 4)
+        // which the stream yields and `advance`s past — silently
+        // skipping 1..3.
         let next = stream.next().await;
         assert!(
             next.is_none(),
