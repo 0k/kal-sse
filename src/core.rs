@@ -209,6 +209,28 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         self.handles.len()
     }
 
+    /// Raw live broadcast receiver, bypassing the `sub_id` registry.
+    ///
+    /// This is the escape hatch for **internal** consumers that want
+    /// live fan-out without participating in the resilient-SSE contract
+    /// — they have no `sub_id`, no replay backlog, no cursor advance,
+    /// no TTL retention.  A lagged consumer simply misses events; if it
+    /// needs to resync it must do so out-of-band (the log will not
+    /// retain anything on its behalf).
+    ///
+    /// Typical caller: an in-process reconciler that recomputes a
+    /// derived view from current state on every event tick.  Such a
+    /// consumer doesn't care about backlog (it always rebuilds from
+    /// scratch) and explicitly does NOT want to pin the buffer, so
+    /// using the regular [`register`](Self::register) / [`attach`](Self::attach)
+    /// dance would leak a live handle that never TTL-expires.
+    ///
+    /// External consumers (HTTP/SSE clients) MUST go through
+    /// `register` + `attach` to get gap-free reconnect.
+    pub fn subscribe_raw(&self) -> broadcast::Receiver<Indexed<E>> {
+        self.subs.subscribe()
+    }
+
     /// Register a subscription at the current cursor — called by the
     /// REST **snapshot** endpoint, which is where a subscription is
     /// born or reset. The cursor lives only on the server from here on;
@@ -666,6 +688,26 @@ mod tests {
         l.append(2);
         l.compact(Instant::now());
         assert!(l.is_empty(), "nothing pins the buffer -> fully dropped");
+    }
+
+    #[tokio::test]
+    async fn subscribe_raw_receives_live_events_without_registering_a_handle() {
+        // The escape hatch for internal consumers: live fan-out with
+        // no sub_id, no backlog, no buffer pinning.  Critical that it
+        // does NOT create a handle (otherwise it would leak a live
+        // pin that never TTL-expires).
+        let mut l = log();
+        let mut rx = l.subscribe_raw();
+        assert_eq!(
+            l.handle_count(),
+            0,
+            "subscribe_raw must NOT register a handle"
+        );
+        l.append(42);
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.index, 1);
+        assert_eq!(got.event, 42);
+        assert_eq!(l.handle_count(), 0, "still no handle after delivery");
     }
 
     #[test]
