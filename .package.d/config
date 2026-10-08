@@ -1,0 +1,6 @@
+NAME="kal-sse"
+DESCRIPTION="Resilient Server-Sent Events: snapshot + cursor data channels with gap-free reconnect"
+EMAIL="valentin.lab@kalysto.org"
+AUTHOR="Valentin Lab"
+AUTHOR_EMAIL="$AUTHOR <$EMAIL>"
+FILES="Cargo.toml"

@@ -1,7 +1,8 @@
 [package]
 name = "kal-sse"
-version = "0.1.0"
+version = "%%version%%"
 edition = "2021"
+rust-version = "1.82"
 authors = ["Valentin Lab <valentin.lab@kalysto.org>"]
 description = "Resilient Server-Sent Events: snapshot + cursor data channels with gap-free reconnect"
 license = "MIT"
@@ -12,11 +13,14 @@ categories = ["web-programming", "asynchronous"]
 exclude = [
     "AGENTS.md",
     "CLAUDE.md",
-    "CHANGELOG.rst",
+    "CLAUDE.local.md",
     "README.org",
     "autogen.sh",
     ".gitchangelog.rc",
     ".gitignore",
+    ".package.d/",
+    ".pkg/",
+    "/doc/",
 ]
 
 [package.metadata.docs.rs]
