@@ -26,13 +26,33 @@
 //! still need, and no more.
 //!
 //! When a subscription's SSE stream drops, the server keeps its handle
-//! for a TTL (default 15 min). A reconnect with the same `sub_id`
-//! (carrying no index — the cursor lives on the server) resumes
-//! **gap-free**: the server replays from the cursor it still holds for
-//! that `sub_id`, then attaches to live. Only when that cursor has
-//! fallen out of the retained buffer (TTL lapsed AND compaction moved
-//! past it) does the server answer [`AttachError::Expired`], and the
-//! client re-snapshots.
+//! for a TTL (chosen by the server in [`EventLog::new`]; 15 minutes is
+//! a reasonable value). A reconnect with the same `sub_id` (carrying no
+//! index — the cursor lives on the server) resumes **gap-free**: the
+//! server replays from the cursor it still holds for that `sub_id`,
+//! then attaches to live. The same TTL bounds the wait between the
+//! snapshot and the first SSE attach, so a snapshot whose stream never
+//! connects does not leak its handle.
+//!
+//! The client must re-snapshot when the server no longer holds the
+//! cursor:
+//!
+//! * [`AttachError::UnknownSub`] — the handle is gone: the TTL lapsed
+//!   and [`EventLog::compact`] reclaimed it, the server restarted, or
+//!   the `sub_id` was never registered.
+//! * [`AttachError::Expired`] — the handle exists but the events after
+//!   its cursor were dropped by the `max_events` hard cap.
+//!
+//! ## Delivery boundary
+//!
+//! "Delivered" means handed to the HTTP stack: the `axum` adapter
+//! advances the cursor when it yields an event to the response body,
+//! with no acknowledgement from the client. Events still buffered in
+//! the HTTP server or the kernel when the connection breaks are lost
+//! for that subscription: the reconnect resumes after them. A client
+//! that needs certainty can check that the `id:` values it receives are
+//! contiguous and re-take the snapshot (proposing the same `sub_id`) on
+//! a gap.
 //!
 //! # Layers
 //!
@@ -119,7 +139,8 @@
 //! 1. `GET` snapshot endpoint (optionally proposing a stored `sub_id`).
 //!    Render the body as current state. Store the returned `sub_id`.
 //! 2. Open SSE: `GET <stream>?sub=<sub_id>`.
-//! 3. Apply each event in order. (`id:` is diagnostic; do not echo it.)
+//! 3. Apply each event in order. (`id:` is diagnostic — never echo it
+//!    to the server; see *Delivery boundary* for the gap check.)
 //! 4. On stream drop: reconnect with the same `sub_id` (step 2).
 //!    Within TTL → gap-free resume.
 //! 5. On `409 needs_snapshot`: go to step 1, proposing the same `sub_id`.
@@ -140,10 +161,12 @@
 //!   subscriber gets `AttachError::Expired` on resume.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod core;
 
 pub use crate::core::{new_sub_id, AttachError, Cursor, Epoch, EventLog, Indexed, Replay, SubId};
 
 #[cfg(feature = "axum")]
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
 pub mod axum;

@@ -19,6 +19,10 @@ exclude = [
     ".gitignore",
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 # `core` only by default — framework-agnostic, no HTTP types.
 default = []

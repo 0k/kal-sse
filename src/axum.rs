@@ -34,7 +34,8 @@ use futures_core::Stream;
 
 use crate::core::{AttachError, EventLog, Indexed, SubId};
 
-/// Default keep-alive interval. Matches vigil-watch's existing streams.
+/// Keep-alive interval: an SSE comment line is sent after this many
+/// seconds without an event, so idle proxies keep the stream open.
 const KEEPALIVE_SECS: u64 = 15;
 
 /// Header carrying the snapshot's cursor on a REST snapshot response.

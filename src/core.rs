@@ -32,7 +32,9 @@ pub type SubId = String;
 /// An event paired with the monotonic index at which it was appended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Indexed<E> {
+    /// Position of `event` on the channel (`1` for the first event).
     pub index: Cursor,
+    /// The event payload.
     pub event: E,
 }
 
@@ -58,7 +60,12 @@ pub enum AttachError {
     /// `max_events` cap dropped events a live cursor still needed).
     /// `earliest` is the oldest retained index; `current` is
     /// `last_index`.
-    Expired { earliest: Cursor, current: Cursor },
+    Expired {
+        /// Oldest index still retained in the buffer.
+        earliest: Cursor,
+        /// The log's `last_index` at the time of the attach.
+        current: Cursor,
+    },
 }
 
 impl std::fmt::Display for AttachError {
