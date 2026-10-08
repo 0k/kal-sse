@@ -40,7 +40,12 @@ pub struct Indexed<E> {
 /// every case the remedy is the same: the client must re-take the REST
 /// snapshot (which mints/re-registers the `sub_id` at a fresh cursor)
 /// and reconnect. The variants exist for diagnostics / wire detail.
+///
+/// Marked `#[non_exhaustive]`: future versions may add variants (for
+/// example a malformed-`sub_id` rejection), so match with a wildcard
+/// arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AttachError {
     /// No handle exists for this `sub_id`: it was never registered via
     /// [`EventLog::register`], or its disconnect TTL lapsed and it was
