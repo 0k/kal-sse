@@ -111,10 +111,12 @@ struct Handle {
     /// (or its starting `since` before any delivery). Advanced by
     /// [`EventLog::advance`] on each delivered event.
     cursor: Cursor,
-    /// `None` while the subscription's stream is live (it pins the
+    /// `None` while the subscription's stream is attached (it pins the
     /// buffer indefinitely as long as it keeps consuming). `Some(t)`
-    /// once the stream drops: the handle is retained until `t`, then
-    /// reclaimed by [`EventLog::compact`].
+    /// while no stream is attached — between the snapshot
+    /// ([`EventLog::register`]) and the first attach, and after the
+    /// stream drops: the handle is retained until `t`, then reclaimed
+    /// by [`EventLog::compact`].
     expires_at: Option<Instant>,
 }
 
@@ -136,10 +138,12 @@ pub struct EventLog<E: Clone + Send + 'static> {
     subs: broadcast::Sender<Indexed<E>>,
     /// Subscription registry: `sub_id -> handle`. A handle pins the
     /// buffer down to its `cursor` (events after it are retained) while
-    /// live, and for `ttl` after disconnect.
+    /// its stream is attached, and for `ttl` after registration or
+    /// disconnect while it is not.
     handles: HashMap<SubId, Handle>,
-    /// How long a disconnected handle is retained before [`compact`]
-    /// may reclaim it.
+    /// How long a handle with no attached stream (registered but not
+    /// yet attached, or disconnected) is retained before
+    /// [`compact`](Self::compact) may reclaim it.
     ttl: Duration,
     /// Hard upper bound on `events.len()`. Even when a handle would pin
     /// more, the oldest events past this are dropped (such a handle
@@ -151,8 +155,11 @@ pub struct EventLog<E: Clone + Send + 'static> {
 impl<E: Clone + Send + 'static> EventLog<E> {
     /// Build an empty log.
     ///
-    /// * `ttl` — disconnect grace: how long a dropped subscription's
-    ///   resume point is held so a reconnect resumes gap-free.
+    /// * `ttl` — grace period of a subscription with no attached
+    ///   stream: how long a dropped subscription's resume point is held
+    ///   so a reconnect resumes gap-free, and how long a snapshot's
+    ///   registration waits for its first attach. There is no default;
+    ///   15 minutes is a reasonable choice.
     /// * `max_events` — hard cap on retained events (memory safety
     ///   valve).
     /// * `channel_capacity` — `tokio::broadcast` buffer depth for live
@@ -243,10 +250,25 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     ///
     /// Returns the effective `sub_id` (minted or adopted) and the
     /// cursor it was pinned at (`last_index` — the client is current up
-    /// to here, the SSE stream delivers everything after). The handle
-    /// is registered live (no TTL) until its SSE stream connects and
-    /// later drops.
+    /// to here, the SSE stream delivers everything after).
+    ///
+    /// The TTL starts at registration: a client that takes the snapshot
+    /// but never opens the SSE stream does not leak its handle — it is
+    /// reclaimed by [`compact`](Self::compact) once the TTL lapses.
+    /// [`attach`](Self::attach) clears the TTL for as long as the stream
+    /// stays connected.
+    ///
+    /// Uses [`Instant::now`] as the registration time; see
+    /// [`register_at`](Self::register_at) to supply it.
     pub fn register(&mut self, sub_id: Option<String>) -> (SubId, Cursor) {
+        self.register_at(sub_id, Instant::now())
+    }
+
+    /// [`register`](Self::register) with an explicit registration time
+    /// `now`, from which the TTL of a not-yet-attached handle runs (same
+    /// clock as [`disconnect`](Self::disconnect) and
+    /// [`compact`](Self::compact)).
+    pub fn register_at(&mut self, sub_id: Option<String>, now: Instant) -> (SubId, Cursor) {
         let id = sub_id.unwrap_or_else(new_sub_id);
         let cursor = self.last_index;
         // Supersede any prior handle for this id (epoch bump).
@@ -259,7 +281,7 @@ impl<E: Clone + Send + 'static> EventLog<E> {
             Handle {
                 epoch,
                 cursor,
-                expires_at: None,
+                expires_at: Some(now + self.ttl),
             },
         );
         (id, cursor)
@@ -501,6 +523,42 @@ mod tests {
             "prior attach is no longer current after re-register"
         );
         assert_eq!(l.handle_count(), 1, "still a single handle for the id");
+    }
+
+    #[test]
+    fn registered_but_never_attached_sub_is_reclaimed_after_ttl() {
+        // A snapshot taken without ever opening the SSE stream must not
+        // leak its handle (nor pin the buffer) forever.
+        let mut l = EventLog::<u32>::new(Duration::from_secs(60), 256, 64);
+        let t0 = Instant::now();
+        let (id, _) = l.register_at(None, t0);
+        l.append(1);
+        l.append(2);
+
+        // Within TTL: handle survives and pins the events after its cursor.
+        l.compact(t0 + Duration::from_secs(30));
+        assert_eq!(l.handle_count(), 1);
+        assert_eq!(l.len(), 2);
+        assert!(l.attach(&id).is_ok(), "attach within TTL resumes");
+
+        // Same scenario, never attached: reclaimed once the TTL lapses.
+        let mut l = EventLog::<u32>::new(Duration::from_secs(60), 256, 64);
+        let (id, _) = l.register_at(None, t0);
+        l.append(1);
+        l.compact(t0 + Duration::from_secs(61));
+        assert_eq!(l.handle_count(), 0);
+        assert!(l.is_empty(), "reclaimed handle no longer pins the buffer");
+        assert_eq!(l.attach(&id).err(), Some(AttachError::UnknownSub));
+    }
+
+    #[test]
+    fn attach_clears_the_registration_ttl() {
+        let mut l = EventLog::<u32>::new(Duration::from_secs(60), 256, 64);
+        let t0 = Instant::now();
+        let (id, _) = l.register_at(None, t0);
+        l.attach(&id).unwrap();
+        l.compact(t0 + Duration::from_secs(10_000));
+        assert_eq!(l.handle_count(), 1, "attached sub never expires");
     }
 
     // --- attach: server-owned cursor, no client-supplied index ---

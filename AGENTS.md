@@ -30,9 +30,13 @@ on the server, keyed by subscription id.
   update. The server advances the subscription's cursor on each
   delivered event — no ack, no heartbeat. The client never tells the
   server where it is; the server knows.
-- **Disconnect TTL (default 15 min)**: a dropped subscription's resume
-  point is held for the TTL so a reconnect (same `sub_id`, no index)
-  resumes gap-free; after that the handle is reclaimed.
+- **TTL (set by the caller of `EventLog::new`, typically 15 min)**: a
+  dropped subscription's resume point is held for the TTL so a
+  reconnect (same `sub_id`, no index) resumes gap-free; after that the
+  handle is reclaimed. The TTL also runs from `register` until the
+  first `attach`, so a snapshot whose stream never connects does not
+  leak its handle. Only an attached stream holds its handle
+  indefinitely.
 - **`409 needs_snapshot`**: returned when the `sub_id` is unknown
   (never registered / TTL-reclaimed / post-restart) or its cursor fell
   out of the retained buffer. The client re-takes the REST snapshot.
