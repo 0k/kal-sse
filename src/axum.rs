@@ -16,8 +16,8 @@
 //!   delivered** (the heart of the contract),
 //! * opens the response body immediately with a comment that carries no
 //!   data or event id and does not advance the subscription cursor,
-//! * marks the subscription disconnected when the stream ends (starts
-//!   its TTL grace),
+//! * uses a drop guard to mark the subscription disconnected (starting
+//!   its TTL grace), including when hyper drops a pending stream,
 //! * answers `409 needs_snapshot` when the `sub_id` is unknown or its
 //!   cursor fell out of the retained window,
 //! * keeps the connection warm with a 15 s `: ping` comment.
@@ -195,10 +195,24 @@ where
     ))
 }
 
+/// Starts the epoch-gated disconnect TTL whenever the stream is destroyed.
+struct DisconnectGuard<E: Clone + Send + 'static> {
+    log: Arc<Mutex<EventLog<E>>>,
+    sub_id: SubId,
+    epoch: Epoch,
+}
+
+impl<E: Clone + Send + 'static> Drop for DisconnectGuard<E> {
+    fn drop(&mut self) {
+        let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        log.disconnect(&self.sub_id, self.epoch, Instant::now());
+    }
+}
+
 /// Internal: open with an immediate comment, then chain the backlog
 /// stream and live stream, advancing the subscription cursor on every
 /// delivered event and marking it disconnected when the live stream
-/// ends.
+/// ends or is dropped, even before its first poll.
 /// `advance` records `Instant::now()` at each hand-off, starting that
 /// event's redelivery window rather than using its append time.
 ///
@@ -221,7 +235,15 @@ where
 {
     use async_stream::stream;
 
+    // Construct outside the generator so even an unpolled stream owns
+    // cleanup; move it inside to release it on normal completion too.
+    let disconnect = DisconnectGuard {
+        log: log.clone(),
+        sub_id: sub_id.clone(),
+        epoch,
+    };
     stream! {
+        let _disconnect = disconnect;
         let serialize = serialize;
         yield Ok(Event::default().comment("connected"));
 
@@ -271,16 +293,6 @@ where
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
-        }
-
-        // 3) Stream ended (client gone / server shutdown / superseded):
-        //    start the disconnect TTL so a reconnect within the grace
-        //    window resumes from retained events. Epoch-gated: a
-        //    superseded stream must NOT start a TTL on the handle that
-        //    replaced it.
-        {
-            let mut g = log.lock().expect("event log mutex poisoned");
-            g.disconnect(&sub_id, epoch, Instant::now());
         }
     }
 }

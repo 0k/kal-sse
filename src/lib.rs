@@ -37,8 +37,9 @@
 //! ## Delivery boundary
 //!
 //! The axum adapter advances immediately before yielding an event to its
-//! response body, and calls [`EventLog::disconnect`] when the stream ends.
-//! An attached handle never expires by TTL. Once detached,
+//! response body. Its drop guard calls [`EventLog::disconnect`] whenever
+//! a stream ends, including a server-side dropped response after a failed
+//! write. An attached handle never expires by TTL. Once detached,
 //! [`EventLog::compact`] reclaims it after TTL.
 //!
 //! ## Layers
@@ -47,7 +48,7 @@
 //!   atomic replay plus live attachment, retention, and [`AttachError`].
 //! * `axum`, behind the `axum` feature, parses resume ids, renders `id:`
 //!   events, sends `409 needs_snapshot`, keeps the stream alive, and
-//!   disconnects it when it ends.
+//!   disconnects it through a drop guard.
 //!
 //! # Wire exchange
 //!

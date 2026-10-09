@@ -11,7 +11,8 @@
 //! * a `Last-Event-ID` older than the snapshot gets `409 needs_snapshot`;
 //! * a `Last-Event-ID` no longer retained gets `409 needs_snapshot`;
 //! * a malformed `Last-Event-ID` gets `400`;
-//! * an unknown `sub_id` gets `409 needs_snapshot`.
+//! * an unknown `sub_id` gets `409 needs_snapshot`;
+//! * a client that goes away for good does not leak its handle.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -353,4 +354,21 @@ async fn unknown_sub_id_gets_409_needs_snapshot() {
             "hint": "resync via GET /things",
         })
     );
+}
+
+#[tokio::test]
+async fn handle_of_a_client_gone_for_good_is_reclaimed_after_ttl() {
+    let (app, base) = serve().await;
+    let (sub, _) = take_snapshot(&base, None).await;
+    lose_c_and_d_in_a_closed_connection(&app, &base, &sub).await;
+
+    // The server has written into the closed connection, so it has found
+    // out the client is gone. A compaction past the TTL must then
+    // reclaim the handle; it must not stay attached forever.
+    wait_until("the gone client's handle is reclaimed", || {
+        let mut g = app.log.lock().unwrap();
+        g.compact(Instant::now() + TTL + Duration::from_secs(1));
+        g.handle_count() == 0
+    })
+    .await;
 }
