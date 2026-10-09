@@ -5,6 +5,8 @@
 //!   what was sent into a dead connection.
 //! * The client's last id is capped at the server cursor; an id below the
 //!   snapshot index gets `Expired`.
+//! * A handle with no attached stream that can no longer resume is
+//!   forgotten at the next compaction.
 
 use std::time::{Duration, Instant};
 
@@ -134,6 +136,34 @@ fn many_sends_within_the_window_stay_cheap() {
 }
 
 #[test]
+fn compact_forgets_an_unattached_handle_that_fell_behind_the_buffer() {
+    let mut log = EventLog::new(TTL, 2, 64);
+    let (sub, _) = log.register(None); // snapshot at 0, never attached
+    for v in 1..=4 {
+        log.append(v); // cap 2: only 3, 4 retained
+    }
+
+    log.compact(Instant::now());
+
+    assert_eq!(log.handle_count(), 0);
+    assert_eq!(log.attach(&sub).err(), Some(AttachError::UnknownSub));
+}
+
+#[test]
+fn compact_keeps_an_attached_handle_that_fell_behind_the_buffer() {
+    let mut log = EventLog::new(TTL, 2, 64);
+    let (sub, _) = log.register(None);
+    let _replay = log.attach(&sub).unwrap(); // stream attached, not consuming
+    for v in 1..=4 {
+        log.append(v);
+    }
+
+    log.compact(Instant::now());
+
+    assert_eq!(log.handle_count(), 1);
+}
+
+#[test]
 fn old_events_get_a_full_window_after_send_not_append() {
     for elapsed in [59, 61] {
         let mut log = EventLog::new(TTL, 256, 64);
@@ -196,4 +226,21 @@ fn reconnect_preserves_send_history_and_noop_advances_do_not_extend_it() {
     assert_eq!(log.len(), 3);
     log.compact(t0 + Duration::from_secs(60));
     assert!(log.is_empty());
+}
+
+#[test]
+fn unattached_resumability_uses_the_redelivery_floor_after_cap_eviction() {
+    let mut log = EventLog::new(TTL, 2, 64);
+    let t0 = Instant::now();
+    let (sub, _) = log.register_at(None, t0);
+    let epoch = log.attach(&sub).unwrap().epoch;
+    for value in 1..=2 {
+        let index = log.append(value);
+        log.advance_at(&sub, epoch, index, t0);
+    }
+    log.append(3);
+    log.disconnect(&sub, epoch, t0);
+    log.compact(t0 + Duration::from_secs(59));
+    assert_eq!(log.handle_count(), 0);
+    assert_eq!(log.attach(&sub).err(), Some(AttachError::UnknownSub));
 }

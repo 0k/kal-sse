@@ -40,7 +40,8 @@
 //! response body. Its drop guard calls [`EventLog::disconnect`] whenever
 //! a stream ends, including a server-side dropped response after a failed
 //! write. An attached handle never expires by TTL. Once detached,
-//! [`EventLog::compact`] reclaims it after TTL.
+//! [`EventLog::compact`] reclaims it after TTL and also forgets an
+//! unattached handle that can no longer resume.
 //!
 //! ## Layers
 //!

@@ -59,7 +59,8 @@ pub struct Indexed<E> {
 pub enum AttachError {
     /// No handle exists for this `sub_id`: it was never registered via
     /// [`EventLog::register`], or its disconnect TTL lapsed and it was
-    /// reclaimed by [`EventLog::compact`], or the daemon restarted and
+    /// reclaimed by [`EventLog::compact`] (also when an unattached handle
+    /// can no longer resume), or the daemon restarted and
     /// lost in-memory state. The client must snapshot to (re)register.
     UnknownSub,
     /// A handle exists but events after the requested resume point are
@@ -143,7 +144,7 @@ struct Handle {
     /// while no stream is attached — between the snapshot
     /// ([`EventLog::register`]) and the first attach, and after the
     /// stream drops: the handle is retained until `t`, then reclaimed
-    /// by [`EventLog::compact`].
+    /// by [`EventLog::compact`], or sooner if it cannot resume.
     expires_at: Option<Instant>,
 }
 
@@ -208,8 +209,8 @@ pub struct EventLog<E: Clone + Send + 'static> {
     redelivery_window: Duration,
     /// Hard upper bound on `events.len()`. Even when a handle would pin
     /// more, the oldest events past this are dropped (such a handle
-    /// then gets [`AttachError::Expired`] on resume — a safety valve
-    /// against unbounded memory).
+    /// then gets [`AttachError::Expired`] on resume, or is forgotten by
+    /// compaction if unattached — a safety valve against unbounded memory).
     max_events: usize,
 }
 
@@ -487,7 +488,7 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     /// Mark a subscription's stream as disconnected: start its TTL
     /// countdown (`now + ttl`) so a reconnect within the window resumes
     /// from retained events, after which [`compact`](Self::compact) may
-    /// reclaim it. No-op for an
+    /// reclaim it (or sooner if its cursor cannot resume). No-op for an
     /// unknown `sub_id` or a stale `epoch` (a superseded stream ending
     /// must NOT start a TTL on the handle that replaced it).
     pub fn disconnect(&mut self, sub_id: &str, epoch: Epoch, now: Instant) {
@@ -498,12 +499,19 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         }
     }
 
-    /// Reclaim expired handles, then trim the buffer on a periodic tick.
+    /// Reclaim expired or unresumable unattached handles, then trim the
+    /// buffer on a periodic tick.
+    ///
+    /// Order: expire TTLs, forget unattached handles whose next event
+    /// precedes the buffer remaining after append's immediate cap trim,
+    /// compute retention, then enforce the cap again. Attached handles
+    /// are never forgotten for falling behind.
     ///
     /// Each surviving handle's floor is `max(base, min(cursor, before))`,
     /// where `before` is the lowest cursor before a send batch whose hand-off
-    /// is still within the redelivery window (or `cursor` if none). Keep
-    /// events above the minimum floor; no handles drops all.
+    /// is still within the redelivery window (or `cursor` if none). This same
+    /// floor decides whether an unattached handle can resume after cap
+    /// eviction. Keep events above the minimum floor; no handles drops all.
     pub fn compact(&mut self, now: Instant) {
         // Drop handles whose disconnect grace has lapsed.
         self.handles
@@ -512,6 +520,14 @@ impl<E: Clone + Send + 'static> EventLog<E> {
             h.prune_sent(now, self.redelivery_window);
         }
 
+        // append already enforced the cap: judge resumability against
+        // the actual retained buffer before choosing a retention floor.
+        let available_floor = self
+            .events
+            .front()
+            .map_or(self.last_index, |first| first.index.saturating_sub(1));
+        self.handles
+            .retain(|_, h| h.expires_at.is_none() || h.resume_floor() >= available_floor);
         let floor = self.handles.values().map(Handle::resume_floor).min();
         let threshold = floor.unwrap_or(self.last_index);
 
@@ -623,6 +639,26 @@ mod tests {
         l.redelivery_window = Duration::MAX;
         l.compact(now);
         assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn compact_forgets_capped_handle_before_computing_retention() {
+        let mut l = EventLog::<u32>::new(Duration::from_secs(900), 2, 64);
+        let (lost, _) = l.register(None);
+        for value in 1..=4 {
+            l.append(value);
+        }
+        let (current, _) = l.register(None);
+
+        l.compact(Instant::now());
+
+        assert_eq!(l.attach(&lost).err(), Some(AttachError::UnknownSub));
+        assert_eq!(l.handle_count(), 1);
+        assert!(
+            l.is_empty(),
+            "the current snapshot covers the capped buffer"
+        );
+        assert!(l.attach(&current).unwrap().backlog.is_empty());
     }
 
     #[test]
