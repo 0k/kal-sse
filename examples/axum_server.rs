@@ -3,6 +3,8 @@
 //! Run with `cargo run --example axum_server --features axum`, then
 //! `curl localhost:3000/api/things` and
 //! `curl -N 'localhost:3000/api/things/stream?sub=<sub>'`.
+//!
+//! `tests/readme.rs` checks that `README.org` shows this file verbatim.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

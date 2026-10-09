@@ -15,6 +15,7 @@ exclude = [
     "CLAUDE.md",
     "CLAUDE.local.md",
     "README.org",
+    "tests/readme.rs",
     "autogen.sh",
     ".gitchangelog.rc",
     ".gitignore",
@@ -45,6 +46,7 @@ async-stream = { version = "0.3", optional = true }
 futures-core = { version = "0.3", optional = true }
 
 [dev-dependencies]
+similar = "2"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "rt-multi-thread", "net"] }
 futures = "0.3"
 bytes = "1"
