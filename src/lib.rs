@@ -76,7 +76,8 @@
 //!   |<----------------------------------|
 //! ```
 //!
-//! Re-registering or re-attaching increments an epoch. A superseded
+//! Re-registering or re-attaching allocates a log-wide epoch, never reused
+//! during the log's lifetime, even after a handle is forgotten. A superseded
 //! stream's advance and disconnect are no-ops; it stops when its next
 //! live event observes the new epoch.
 //!

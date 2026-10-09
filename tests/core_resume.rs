@@ -164,6 +164,27 @@ fn compact_keeps_an_attached_handle_that_fell_behind_the_buffer() {
 }
 
 #[test]
+fn forgotten_handle_never_reuses_a_still_open_stream_epoch() {
+    let mut log = EventLog::<u32>::new(TTL, 256, 64);
+    let t0 = Instant::now();
+    let (sub, _) = log.register_at(None, t0);
+    let stream_a = log.attach(&sub).unwrap();
+    log.register_at(Some(sub.clone()), t0);
+    log.compact(t0 + TTL);
+    assert_eq!(log.handle_count(), 0);
+
+    let now = t0 + TTL;
+    log.register_at(Some(sub.clone()), now);
+    let stream_b = log.attach(&sub).unwrap();
+    assert!(!log.is_current(&sub, stream_a.epoch));
+    assert!(log.is_current(&sub, stream_b.epoch));
+    log.disconnect(&sub, stream_a.epoch, now);
+    log.compact(now + 10 * TTL);
+    assert_eq!(log.handle_count(), 1);
+    assert!(log.is_current(&sub, stream_b.epoch));
+}
+
+#[test]
 fn old_events_get_a_full_window_after_send_not_append() {
     for elapsed in [59, 61] {
         let mut log = EventLog::new(TTL, 256, 64);

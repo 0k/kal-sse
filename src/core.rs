@@ -101,6 +101,8 @@ impl std::error::Error for AttachError {}
 /// calls become no-ops, and [`EventLog::is_current`] reports `false`
 /// so the adapter can terminate it. At most one live attach per
 /// `sub_id` is ever authoritative.
+/// Generations are never reused during the life of an event log, even after
+/// a handle is forgotten and its subscription id is registered again.
 pub type Epoch = u64;
 
 /// The result of attaching a subscription: the events to replay
@@ -192,6 +194,8 @@ pub struct EventLog<E: Clone + Send + 'static> {
     events: VecDeque<Indexed<E>>,
     /// Index of the most recently appended event. Starts at `0`.
     last_index: Cursor,
+    /// Log-wide generation allocator, independent of handle reclamation.
+    next_epoch: Epoch,
     /// Live fan-out. Lagged receivers get `Lagged` and must resync via
     /// a fresh snapshot + [`EventLog::attach`].
     subs: broadcast::Sender<Indexed<E>>,
@@ -236,6 +240,7 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         Self {
             events: VecDeque::new(),
             last_index: 0,
+            next_epoch: 0,
             subs,
             handles: HashMap::new(),
             ttl,
@@ -348,11 +353,7 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     pub fn register_at(&mut self, sub_id: Option<String>, now: Instant) -> (SubId, Cursor) {
         let id = sub_id.unwrap_or_else(new_sub_id);
         let cursor = self.last_index;
-        // Supersede any prior handle for this id (epoch bump).
-        let epoch = match self.handles.get(&id) {
-            Some(h) => h.epoch + 1,
-            None => 0,
-        };
+        let epoch = self.allocate_epoch();
         self.handles.insert(
             id.clone(),
             Handle {
@@ -415,22 +416,20 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         sub_id: &str,
         last_event_id: Option<Cursor>,
     ) -> Result<Replay<E>, AttachError> {
-        let (since, epoch) = match self.handles.get(sub_id) {
+        let since = match self.handles.get(sub_id) {
             // A client behind the snapshot base never saw this snapshot of
             // the subscription (e.g. a superseded holder of the same id).
             Some(h) if last_event_id.is_some_and(|id| id < h.base) => {
                 return Err(self.expired());
             }
-            Some(h) => (
-                last_event_id.map_or(h.cursor, |id| id.min(h.cursor)),
-                h.epoch + 1,
-            ),
+            Some(h) => last_event_id.map_or(h.cursor, |id| id.min(h.cursor)),
             None => return Err(AttachError::UnknownSub),
         };
         // Subscribe first so nothing can be appended between computing
         // the backlog and obtaining the receiver.
         let live = self.subs.subscribe();
         let backlog = self.events_since(since)?;
+        let epoch = self.allocate_epoch();
         // Bump the generation: any prior live stream for this sub_id is
         // now superseded. Re-pin live (clear any disconnect TTL).
         let handle = self.handles.get_mut(sub_id).expect("handle checked above");
@@ -588,6 +587,12 @@ impl<E: Clone + Send + 'static> EventLog<E> {
             .filter(|e| e.index > since)
             .cloned()
             .collect())
+    }
+
+    fn allocate_epoch(&mut self) -> Epoch {
+        let epoch = self.next_epoch;
+        self.next_epoch = epoch.checked_add(1).expect("event log epoch exhausted");
+        epoch
     }
 }
 

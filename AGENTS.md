@@ -49,7 +49,8 @@ one logical subscription to one data flow, not a tab/window/app.
   unavailable backlogs are `AttachError::Expired` and include earliest
   and current indexes. The client re-takes the REST snapshot.
 - **Epoch / supersede**: re-attaching or re-registering a `sub_id`
-  bumps an epoch; the superseded stream's `advance`/`disconnect`
+  allocates a log-wide epoch, never reused during the log's lifetime,
+  even after handle reclamation; the superseded stream's `advance`/`disconnect`
   become no-ops and `is_current` reports false. The superseded live
   stream ends when its next event observes that state. At most one live
   attach per `sub_id` is authoritative.
@@ -88,6 +89,8 @@ adapter the only place that knows about the wire.
    place — handles never accumulate across reconnects.
 4. The adapter's drop guard calls `disconnect` however a stream ends,
    including a response body dropped after a failed write.
+5. Register and attach use the same log-wide epoch allocator. Never derive
+   epochs from a handle: a forgotten id must not revive a superseded stream.
 
 ## Build / Test
 
