@@ -51,3 +51,20 @@ fn readme_server_example_matches_the_compiled_axum_example() {
 
     assert_text_eq(readme_rust_block(&readme), example_body(&example));
 }
+
+#[test]
+fn readme_exposes_release_metadata_and_core_installation() {
+    let readme = read_project_file("README.org");
+
+    for required in [
+        "[[https://crates.io/crates/kal-sse][https://img.shields.io/crates/v/kal-sse.svg]]",
+        "[[https://docs.rs/kal-sse][https://docs.rs/kal-sse/badge.svg]]",
+        "[[https://github.com/0k/kal-sse/blob/master/LICENSE][https://img.shields.io/badge/license-MIT-blue.svg]]",
+        "cargo add kal-sse",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README.org must contain {required}"
+        );
+    }
+}

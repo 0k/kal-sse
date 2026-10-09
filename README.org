@@ -3,6 +3,30 @@
 Resilient Server-Sent Events: snapshot + cursor data channels with
 gap-free reconnect.
 
+[[https://crates.io/crates/kal-sse][https://img.shields.io/crates/v/kal-sse.svg]]
+[[https://docs.rs/kal-sse][https://docs.rs/kal-sse/badge.svg]]
+[[https://github.com/0k/kal-sse/blob/master/LICENSE][https://img.shields.io/badge/license-MIT-blue.svg]]
+
+* Installation
+
+Core:
+
+#+begin_src sh
+cargo add kal-sse
+#+end_src
+
+Axum adapter:
+
+#+begin_src sh
+cargo add kal-sse --features axum
+#+end_src
+
+Or add this dependency:
+
+#+begin_src toml
+kal-sse = { version = "0.2", features = ["axum"] }
+#+end_src
+
 * What it is
 
 A *data channel* pairs a REST snapshot with an SSE update stream. One
