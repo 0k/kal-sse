@@ -2,8 +2,9 @@
 //!
 //! [`EventLog`] is an append-only, index-tagged event log with a
 //! per-subscription cursor registry. It owns the "intelligent buffer":
-//! it retains exactly the events that some live or recently-disconnected
-//! subscription might still need to replay, and drops the rest.
+//! it retains undelivered events and a timed redelivery window of sent
+//! events after each subscription's snapshot, subject to a hard cap.
+//! A resume hint can rewind the server cursor within those bounds.
 //!
 //! It knows nothing about HTTP, SSE wire format, axum, or `serde` — it
 //! is a pure data structure plus a `tokio` broadcast channel for live
@@ -19,6 +20,13 @@ use tokio::sync::broadcast;
 /// `last_index == 0` and no events, so a subscription `since == 0`
 /// replays nothing). Each appended event gets `previous + 1`.
 pub type Cursor = u64;
+
+/// Default retention window after events are sent: 60 s.
+///
+/// This is four times the adapter's 15 s keep-alive interval, so a closed
+/// client is normally detected well within the window. The hard event cap
+/// still takes precedence over this grace period.
+pub const DEFAULT_REDELIVERY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Stable identifier for one logical subscription to one data channel.
 ///
@@ -54,10 +62,9 @@ pub enum AttachError {
     /// reclaimed by [`EventLog::compact`], or the daemon restarted and
     /// lost in-memory state. The client must snapshot to (re)register.
     UnknownSub,
-    /// A handle exists but its stored cursor is older than the oldest
-    /// event still retained — the subscription fell so far behind that
-    /// the gap is unrecoverable (only possible when the hard
-    /// `max_events` cap dropped events a live cursor still needed).
+    /// A handle exists but events after the requested resume point are
+    /// no longer retained, due to hard-cap eviction or expiration of the
+    /// redelivery window for previously sent events.
     /// `earliest` is the oldest retained index; `current` is
     /// `last_index`.
     Expired {
@@ -119,10 +126,18 @@ struct Handle {
     /// `sub_id`. Bumped on every `attach`; mutations carrying a stale
     /// epoch are ignored (the prior subscription was superseded).
     epoch: Epoch,
-    /// The highest index the server has delivered to this subscription
-    /// (or its starting `since` before any delivery). Advanced by
-    /// [`EventLog::advance`] on each delivered event.
+    /// Snapshot index, reset only by registration. Resume hints and
+    /// retention cannot rewind below this position.
+    base: Cursor,
+    /// Server delivery position (initially `base`). Advanced by
+    /// [`EventLog::advance`]; a successful attach with a resume hint may
+    /// rewind it, but never below `base`.
     cursor: Cursor,
+    /// Time of the last advance that moved the cursor.
+    advanced_at: Option<Instant>,
+    /// Cursor before each send batch and its hand-off time. Recent batches
+    /// survive reconnects, including cursor rewinds, until their window ends.
+    sent: VecDeque<(Cursor, Instant)>,
     /// `None` while the subscription's stream is attached (it pins the
     /// buffer indefinitely as long as it keeps consuming). `Some(t)`
     /// while no stream is attached — between the snapshot
@@ -132,16 +147,47 @@ struct Handle {
     expires_at: Option<Instant>,
 }
 
+impl Handle {
+    fn prune_sent(&mut self, now: Instant, window: Duration) {
+        if self
+            .advanced_at
+            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) >= window)
+        {
+            self.sent.clear();
+            return;
+        }
+        // Send times are nondecreasing, so expired records are at the front.
+        while self
+            .sent
+            .front()
+            .is_some_and(|(_, sent_at)| now.saturating_duration_since(*sent_at) >= window)
+        {
+            self.sent.pop_front();
+        }
+    }
+
+    fn resume_floor(&self) -> Cursor {
+        self.base.max(
+            self.sent
+                .iter()
+                .map(|(before, _)| *before)
+                .min()
+                .unwrap_or(self.cursor)
+                .min(self.cursor),
+        )
+    }
+}
+
 /// Append-only, index-tagged event log with a per-subscription cursor
-/// registry and cursor-frontier retention.
+/// registry and cursor-frontier retention with a timed redelivery window.
 ///
 /// `E` is the channel's event type. It must be `Clone` (each live
 /// subscriber gets its own copy via the broadcast channel) and
 /// `Send + 'static` (it crosses the broadcast boundary).
 pub struct EventLog<E: Clone + Send + 'static> {
-    /// Retained events, oldest first. Invariant: indices are
-    /// contiguous and ascending, and `back().index == last_index`
-    /// whenever non-empty.
+    /// Retained events, oldest first. Indices are
+    /// contiguous and ascending; the last event has `last_index` when
+    /// non-empty.
     events: VecDeque<Indexed<E>>,
     /// Index of the most recently appended event. Starts at `0`.
     last_index: Cursor,
@@ -149,18 +195,21 @@ pub struct EventLog<E: Clone + Send + 'static> {
     /// a fresh snapshot + [`EventLog::attach`].
     subs: broadcast::Sender<Indexed<E>>,
     /// Subscription registry: `sub_id -> handle`. A handle pins the
-    /// buffer down to its `cursor` (events after it are retained) while
-    /// its stream is attached, and for `ttl` after registration or
-    /// disconnect while it is not.
+    /// buffer for undelivered events and young sent events after `base`.
+    /// Attached handles do not expire; unattached handles survive up to
+    /// `ttl`, unless the retained buffer no longer permits resume.
     handles: HashMap<SubId, Handle>,
     /// How long a handle with no attached stream (registered but not
     /// yet attached, or disconnected) is retained before
     /// [`compact`](Self::compact) may reclaim it.
     ttl: Duration,
+    /// Grace period after hand-off during which sent events remain
+    /// replayable on behalf of surviving handles, bounded by the cap.
+    redelivery_window: Duration,
     /// Hard upper bound on `events.len()`. Even when a handle would pin
     /// more, the oldest events past this are dropped (such a handle
-    /// then gets [`AttachError::Expired`] on resume — a deliberate safety
-    /// valve against unbounded memory from a stuck subscriber).
+    /// then gets [`AttachError::Expired`] on resume — a safety valve
+    /// against unbounded memory).
     max_events: usize,
 }
 
@@ -177,6 +226,10 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     /// * `channel_capacity` — `tokio::broadcast` buffer depth for live
     ///   fan-out; a consumer slower than this many events behind gets
     ///   `Lagged` and must resync.
+    ///
+    /// Sent events are retained for [`DEFAULT_REDELIVERY_WINDOW`] after
+    /// being sent on behalf of surviving handles. Override this with
+    /// [`with_redelivery_window`](Self::with_redelivery_window).
     pub fn new(ttl: Duration, max_events: usize, channel_capacity: usize) -> Self {
         let (subs, _) = broadcast::channel(channel_capacity.max(1));
         Self {
@@ -185,8 +238,19 @@ impl<E: Clone + Send + 'static> EventLog<E> {
             subs,
             handles: HashMap::new(),
             ttl,
+            redelivery_window: DEFAULT_REDELIVERY_WINDOW,
             max_events: max_events.max(1),
         }
+    }
+
+    /// Set the retention window for redelivering already-sent events.
+    ///
+    /// The window runs after being sent (cursor advancement), never retains
+    /// events covered by a handle's snapshot, and does not override handle
+    /// TTL or the `max_events` cap.
+    pub fn with_redelivery_window(mut self, window: Duration) -> Self {
+        self.redelivery_window = window;
+        self
     }
 
     /// Append an event, returning its freshly assigned index. Fans it
@@ -207,8 +271,8 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     }
 
     /// Current `last_index`. This is the cursor a REST snapshot hands
-    /// out alongside the materialised state: the client then attaches
-    /// with `since == this` to receive only subsequent events.
+    /// out alongside the materialised state. Registration pins the
+    /// handle's snapshot base and cursor here to receive subsequent events.
     pub fn last_index(&self) -> Cursor {
         self.last_index
     }
@@ -252,8 +316,8 @@ impl<E: Clone + Send + 'static> EventLog<E> {
 
     /// Register a subscription at the current cursor — called by the
     /// REST **snapshot** endpoint, which is where a subscription is
-    /// born or reset. The cursor lives only on the server from here on;
-    /// the client never sends an index, only its `sub_id`.
+    /// born or reset. Both the snapshot base and server cursor are reset
+    /// to `last_index`; a later resume hint cannot rewind below this base.
     ///
     /// * `sub_id` — `Some(id)` to adopt a client-proposed id (which
     ///   **supersedes any prior handle** for that id — invalidating the
@@ -292,7 +356,10 @@ impl<E: Clone + Send + 'static> EventLog<E> {
             id.clone(),
             Handle {
                 epoch,
+                base: cursor,
                 cursor,
+                advanced_at: None,
+                sent: VecDeque::new(),
                 expires_at: Some(now + self.ttl),
             },
         );
@@ -305,8 +372,8 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     ///
     /// The resume cursor is read from the server-side handle (set by
     /// [`register`](Self::register) at snapshot time, then advanced on
-    /// every delivered event) — the client supplies ONLY its `sub_id`,
-    /// never an index.
+    /// every delivered event). Equivalent to
+    /// [`attach_from`](Self::attach_from) with no resume hint.
     ///
     /// Attaching bumps the handle's epoch, so if the same `sub_id` had
     /// another live stream (e.g. a reconnect racing the old socket's
@@ -316,7 +383,7 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     ///
     /// Errors:
     /// * [`AttachError::UnknownSub`] — no handle (never registered, or
-    ///   TTL-reclaimed, or post-restart). Client must snapshot.
+    ///   reclaimed by compaction, or post-restart). Client must snapshot.
     /// * [`AttachError::Expired`] — handle exists but its cursor fell
     ///   behind the retained buffer (hard-cap eviction). Client must
     ///   snapshot.
@@ -325,8 +392,38 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     /// two are consistent: any event appended after this call lands in
     /// the receiver; everything up to `last_index` is in the backlog.
     pub fn attach(&mut self, sub_id: &str) -> Result<Replay<E>, AttachError> {
-        let since = match self.handles.get(sub_id) {
-            Some(h) => h.cursor,
+        self.attach_from(sub_id, None)
+    }
+
+    /// Attach using an optional last-received event index as a resume hint.
+    ///
+    /// With no hint, resume from the server cursor. Otherwise resume from
+    /// the hint, capped at the server cursor; a hint below the snapshot
+    /// base returns [`AttachError::Expired`]: that client never saw the
+    /// current snapshot of this `sub_id`. On success the
+    /// cursor is set to this resume point, the epoch is bumped, and the
+    /// unattached TTL is cleared without changing the snapshot base.
+    /// The live receiver is obtained before reading the backlog, under
+    /// the same exclusive borrow, just as in [`attach`](Self::attach).
+    ///
+    /// Returns [`AttachError::UnknownSub`] for an unknown handle, or
+    /// [`AttachError::Expired`] if the requested backlog is unavailable.
+    /// A failed attach leaves the handle unchanged.
+    pub fn attach_from(
+        &mut self,
+        sub_id: &str,
+        last_event_id: Option<Cursor>,
+    ) -> Result<Replay<E>, AttachError> {
+        let (since, epoch) = match self.handles.get(sub_id) {
+            // A client behind the snapshot base never saw this snapshot of
+            // the subscription (e.g. a superseded holder of the same id).
+            Some(h) if last_event_id.is_some_and(|id| id < h.base) => {
+                return Err(self.expired());
+            }
+            Some(h) => (
+                last_event_id.map_or(h.cursor, |id| id.min(h.cursor)),
+                h.epoch + 1,
+            ),
             None => return Err(AttachError::UnknownSub),
         };
         // Subscribe first so nothing can be appended between computing
@@ -335,15 +432,10 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         let backlog = self.events_since(since)?;
         // Bump the generation: any prior live stream for this sub_id is
         // now superseded. Re-pin live (clear any disconnect TTL).
-        let epoch = self.handles.get(sub_id).map(|h| h.epoch + 1).unwrap_or(0);
-        self.handles.insert(
-            sub_id.to_string(),
-            Handle {
-                epoch,
-                cursor: since,
-                expires_at: None,
-            },
-        );
+        let handle = self.handles.get_mut(sub_id).expect("handle checked above");
+        handle.epoch = epoch;
+        handle.cursor = since;
+        handle.expires_at = None;
         Ok(Replay {
             epoch,
             backlog,
@@ -360,16 +452,33 @@ impl<E: Clone + Send + 'static> EventLog<E> {
 
     /// Advance a subscription's cursor to `index` — call this each time
     /// the corresponding event has been *delivered* to that
-    /// subscription's SSE stream. Delivery is the update: once advanced,
-    /// the buffer no longer needs to retain events up to `index` on this
-    /// subscription's behalf.
+    /// subscription's SSE stream. The server delivery position advances,
+    /// but sent events after the snapshot remain retained within the
+    /// redelivery window, subject to the hard cap.
     ///
     /// No-op if the `sub_id` is unknown, if `epoch` is stale (a
     /// superseded subscription), or if `index` does not move the cursor
     /// forward.
     pub fn advance(&mut self, sub_id: &str, epoch: Epoch, index: Cursor) {
+        self.advance_at(sub_id, epoch, index, Instant::now());
+    }
+
+    /// [`advance`](Self::advance) with an explicit HTTP hand-off time.
+    ///
+    /// Only an advance that moves the current attach's cursor starts a
+    /// redelivery window. A batch advance treats all indexes between the
+    /// previous cursor and `index` as sent at `now`. Use the same clock as
+    /// [`compact`](Self::compact); callers should supply nondecreasing times.
+    /// Recent send records are retained across reconnects and pruned to the
+    /// window, so their number is bounded by advances within that window.
+    pub fn advance_at(&mut self, sub_id: &str, epoch: Epoch, index: Cursor, now: Instant) {
         if let Some(h) = self.handles.get_mut(sub_id) {
             if h.epoch == epoch && index > h.cursor {
+                h.prune_sent(now, self.redelivery_window);
+                if !self.redelivery_window.is_zero() {
+                    h.sent.push_back((h.cursor, now));
+                }
+                h.advanced_at = Some(now);
                 h.cursor = index;
             }
         }
@@ -377,8 +486,8 @@ impl<E: Clone + Send + 'static> EventLog<E> {
 
     /// Mark a subscription's stream as disconnected: start its TTL
     /// countdown (`now + ttl`) so a reconnect within the window resumes
-    /// gap-free, after which [`compact`](Self::compact) may reclaim
-    /// it. No-op for an
+    /// from retained events, after which [`compact`](Self::compact) may
+    /// reclaim it. No-op for an
     /// unknown `sub_id` or a stale `epoch` (a superseded stream ending
     /// must NOT start a TTL on the handle that replaced it).
     pub fn disconnect(&mut self, sub_id: &str, epoch: Epoch, now: Instant) {
@@ -389,23 +498,21 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         }
     }
 
-    /// Reclaim expired handles, then trim the buffer down to the oldest
-    /// cursor still pinned by any surviving handle. Call on a periodic
-    /// tick.
+    /// Reclaim expired handles, then trim the buffer on a periodic tick.
     ///
-    /// Retention rule: keep every event with index strictly greater
-    /// than `min(handle.cursor for all surviving handles)`. With no
-    /// surviving handles, the buffer may be dropped entirely (down to
-    /// the `max_events` cap, which `append` already enforces).
+    /// Each surviving handle's floor is `max(base, min(cursor, before))`,
+    /// where `before` is the lowest cursor before a send batch whose hand-off
+    /// is still within the redelivery window (or `cursor` if none). Keep
+    /// events above the minimum floor; no handles drops all.
     pub fn compact(&mut self, now: Instant) {
         // Drop handles whose disconnect grace has lapsed.
         self.handles
             .retain(|_, h| h.expires_at.is_none_or(|t| t > now));
+        for h in self.handles.values_mut() {
+            h.prune_sent(now, self.redelivery_window);
+        }
 
-        // The retention floor is the lowest cursor any surviving
-        // handle still sits at; events at or below it are no longer
-        // needed by anyone.
-        let floor = self.handles.values().map(|h| h.cursor).min();
+        let floor = self.handles.values().map(Handle::resume_floor).min();
         let threshold = floor.unwrap_or(self.last_index);
 
         while let Some(front) = self.events.front() {
@@ -423,10 +530,18 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         }
     }
 
+    /// [`AttachError::Expired`] describing the current retained buffer.
+    fn expired(&self) -> AttachError {
+        AttachError::Expired {
+            earliest: self.events.front().map_or(self.last_index, |e| e.index),
+            current: self.last_index,
+        }
+    }
+
     /// Events strictly after `since`, in order. `since == last_index`
-    /// yields an empty vec. Returns [`AttachError::Expired`] when
-    /// `since` is older than the oldest retained event, or ahead of
-    /// `last_index` (only possible after a restart that lost state).
+    /// yields an empty vec. Returns [`AttachError::Expired`] when the
+    /// next required event is no longer retained (including an empty
+    /// buffer with `since < last_index`), or `since` is ahead of the log.
     fn events_since(&self, since: Cursor) -> Result<Vec<Indexed<E>>, AttachError> {
         if since == self.last_index {
             return Ok(Vec::new());
@@ -445,7 +560,7 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         // The client holds `since` and needs `since + 1` onward. If the
         // oldest event we still have is newer than `since + 1`, the gap
         // is unrecoverable.
-        if since + 1 < earliest {
+        if self.events.is_empty() || since.saturating_add(1) < earliest {
             return Err(AttachError::Expired {
                 earliest,
                 current: self.last_index,
@@ -484,6 +599,30 @@ mod tests {
         let l = log();
         assert_eq!(l.last_index(), 0);
         assert!(l.is_empty());
+    }
+
+    #[test]
+    fn redelivery_floor_uses_send_times_at_the_window_boundary() {
+        let mut l = log();
+        let (id, _) = l.register(None);
+        let epoch = l.attach(&id).unwrap().epoch;
+        let now = Instant::now();
+        for value in 1..=3 {
+            l.append(value);
+        }
+        l.advance_at(&id, epoch, 1, now - DEFAULT_REDELIVERY_WINDOW);
+        l.advance_at(&id, epoch, 3, now);
+
+        l.compact(now);
+
+        assert_eq!(
+            l.events.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        // Even a window too large to represent as an Instant keeps sends.
+        l.redelivery_window = Duration::MAX;
+        l.compact(now);
+        assert_eq!(l.len(), 2);
     }
 
     #[test]
@@ -573,7 +712,7 @@ mod tests {
         assert_eq!(l.handle_count(), 1, "attached sub never expires");
     }
 
-    // --- attach: server-owned cursor, no client-supplied index ---
+    // --- attach: server-owned cursor without a resume hint ---
 
     #[test]
     fn attach_replays_from_registered_cursor() {
@@ -661,8 +800,10 @@ mod tests {
         l.compact(now);
         assert_eq!(l.len(), 5, "live sub pinned at 0 retains everything");
         // Deliver events up to index 3 to it.
-        l.advance(&id, ep, 3);
+        l.advance_at(&id, ep, 3, now);
         l.compact(now);
+        assert_eq!(l.len(), 5, "young sent events remain replayable");
+        l.compact(now + DEFAULT_REDELIVERY_WINDOW);
         let idxs: Vec<_> = l.events.iter().map(|e| e.index).collect();
         assert_eq!(idxs, vec![4, 5]);
     }
@@ -700,11 +841,11 @@ mod tests {
         let t0 = Instant::now();
         l.disconnect(&id, ep, t0);
 
-        // Within TTL: handle survives, still pins events after cursor 1.
+        // Within TTL and redelivery window: even sent event 1 is retained.
         l.compact(t0 + Duration::from_secs(30));
         assert_eq!(l.handle_count(), 1);
         let idxs: Vec<_> = l.events.iter().map(|e| e.index).collect();
-        assert_eq!(idxs, vec![2], "retains events after the pinned cursor");
+        assert_eq!(idxs, vec![1, 2], "retains young sent events too");
 
         // After TTL: handle reclaimed, buffer free to drop.
         l.compact(t0 + Duration::from_secs(61));
@@ -792,7 +933,7 @@ mod tests {
         let es = l.attach(&slow).unwrap().epoch;
         l.advance(&fast, ef, 5);
         l.advance(&slow, es, 2);
-        l.compact(Instant::now());
+        l.compact(Instant::now() + DEFAULT_REDELIVERY_WINDOW);
         // Floor is the SLOW sub at 2 -> keep 3,4,5.
         let idxs: Vec<_> = l.events.iter().map(|e| e.index).collect();
         assert_eq!(idxs, vec![3, 4, 5]);

@@ -5,16 +5,18 @@
 //! * looks up the subscription's resume cursor by `sub_id` — the
 //!   cursor is server-side state (set by the REST snapshot via
 //!   [`EventLog::register`](crate::core::EventLog::register), then
-//!   advanced on every delivered event), so the SSE request carries
-//!   ONLY `?sub=<uuid>`, never an index,
+//!   advanced on every event handed to the HTTP stack); the request
+//!   identifies the handle with `?sub=<uuid>`,
+//! * optionally parses `Last-Event-ID` with [`last_event_id`] and uses
+//!   [`sse_response_from`] to rewind within the snapshot/server-cursor
+//!   bounds, replaying events sent into a dead socket while retained,
 //! * atomically replays the backlog then attaches to live,
-//! * tags every event with `id: <index>` (diagnostic / parity with the
-//!   SSE spec; the client does not need to echo it back),
+//! * tags every event with `id: <index>` for the client's resume hint,
 //! * **advances the subscription's server-side cursor as each event is
 //!   delivered** (the heart of the contract),
 //! * opens the response body immediately with a comment that carries no
 //!   data or event id and does not advance the subscription cursor,
-//! * marks the subscription disconnected when the stream drops (starts
+//! * marks the subscription disconnected when the stream ends (starts
 //!   its TTL grace),
 //! * answers `409 needs_snapshot` when the `sub_id` is unknown or its
 //!   cursor fell out of the retained window,
@@ -27,25 +29,77 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Json;
 use futures_core::Stream;
 
-use crate::core::{AttachError, EventLog, Indexed, SubId};
+use crate::core::{AttachError, Cursor, Epoch, EventLog, Indexed, SubId};
 
 /// Keep-alive interval: an SSE comment line is sent after this many
 /// seconds without an event, so idle proxies keep the stream open.
 const KEEPALIVE_SECS: u64 = 15;
 
 /// Header carrying the snapshot's cursor on a REST snapshot response.
-/// Informational: the client does NOT need to send it back (the server
-/// keys the cursor by `sub_id`), but it is useful for debugging and for
-/// non-`kal-sse` consumers.
+/// The client takes it as its last applied id and sends it as
+/// `last_event_id` when it opens the stream; an id older than the
+/// current snapshot gets `409 needs_snapshot`. A browser on another
+/// origin can read this header only if the snapshot response sends
+/// `Access-Control-Expose-Headers: x-snapshot-index`.
 pub const SNAPSHOT_INDEX_HEADER: &str = "x-snapshot-index";
 
 /// Header / query name carrying the subscription id on an SSE request.
 pub const SUB_ID_PARAM: &str = "sub";
+
+/// SSE request header carrying the index of the last event the client
+/// applied. Browsers send it themselves when an `EventSource` retries.
+pub const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+
+/// Query parameter carrying the same index as [`LAST_EVENT_ID_HEADER`].
+///
+/// A browser `EventSource` cannot set request headers, so a client that
+/// opens a new `EventSource` to reconnect passes the index here instead
+/// (`?sub=<uuid>&last_event_id=<index>`).
+pub const LAST_EVENT_ID_PARAM: &str = "last_event_id";
+
+/// Parse the index of the last event the client applied, from the
+/// [`LAST_EVENT_ID_HEADER`] header or else the [`LAST_EVENT_ID_PARAM`]
+/// query value (`query`, as extracted by the caller).
+///
+/// The header wins when both are present: a browser sends it when it
+/// retries the very URL that carried the query value, so it is newer.
+///
+/// Accepts only ASCII decimal digits after trimming surrounding
+/// whitespace. Invalid bytes, an empty value, or an overflowing index
+/// return a `400` JSON body with `error: "bad_last_event_id"` and the
+/// lossy original value.
+pub fn last_event_id(
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Result<Option<Cursor>, (StatusCode, Json<serde_json::Value>)> {
+    let raw = match headers.get(LAST_EVENT_ID_HEADER) {
+        Some(value) => value.as_bytes(),
+        None => match query {
+            Some(value) => value.as_bytes(),
+            None => return Ok(None),
+        },
+    };
+    if let Ok(text) = std::str::from_utf8(raw) {
+        let text = text.trim();
+        if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(index) = text.parse() {
+                return Ok(Some(index));
+            }
+        }
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "bad_last_event_id",
+            "value": String::from_utf8_lossy(raw),
+        })),
+    ))
+}
 
 /// The `409 Conflict` body returned when a subscription cannot resume
 /// (unknown `sub_id` or its cursor expired). The client must re-take
@@ -80,6 +134,8 @@ fn needs_snapshot_body(
 /// On success returns an [`Sse`] streaming the backlog then live
 /// updates; on an unknown / expired subscription returns the `409`
 /// tuple so the caller can `?`-propagate it as an axum response.
+/// Uses the server cursor without a resume hint; see [`sse_response_from`]
+/// to recover events handed to the HTTP stack but not received by the client.
 #[allow(clippy::type_complexity)]
 pub fn sse_response<E, F>(
     log: Arc<Mutex<EventLog<E>>>,
@@ -94,9 +150,34 @@ where
     E: Clone + Send + 'static,
     F: Fn(&E) -> String + Send + 'static,
 {
+    sse_response_from(log, sub_id, None, serialize, resync_hint)
+}
+
+/// Build a resilient SSE response with an optional last-received event index.
+///
+/// Like [`sse_response`], but uses [`EventLog::attach_from`] to resume
+/// from the client's hint (capped at the server cursor; below the
+/// snapshot base it gets `409 needs_snapshot`). Pass the result of
+/// [`last_event_id`] to replay events lost in HTTP/socket buffers. Returns
+/// `409 needs_snapshot` if the handle or requested backlog is unavailable.
+#[allow(clippy::type_complexity)]
+pub fn sse_response_from<E, F>(
+    log: Arc<Mutex<EventLog<E>>>,
+    sub_id: SubId,
+    last_event_id: Option<Cursor>,
+    serialize: F,
+    resync_hint: &str,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>,
+    (StatusCode, Json<serde_json::Value>),
+>
+where
+    E: Clone + Send + 'static,
+    F: Fn(&E) -> String + Send + 'static,
+{
     let replay = {
         let mut guard = log.lock().expect("event log mutex poisoned");
-        match guard.attach(&sub_id) {
+        match guard.attach_from(&sub_id, last_event_id) {
             Ok(r) => r,
             Err(err) => {
                 return Err(needs_snapshot_body(&sub_id, err, resync_hint));
@@ -118,6 +199,8 @@ where
 /// stream and live stream, advancing the subscription cursor on every
 /// delivered event and marking it disconnected when the live stream
 /// ends.
+/// `advance` records `Instant::now()` at each hand-off, starting that
+/// event's redelivery window rather than using its append time.
 ///
 /// `epoch` is this attach's generation: if a later attach supersedes
 /// this `sub_id` (the client re-subscribed to the same data flow), the
@@ -127,7 +210,7 @@ where
 fn build_stream<E, F>(
     log: Arc<Mutex<EventLog<E>>>,
     sub_id: SubId,
-    epoch: crate::core::Epoch,
+    epoch: Epoch,
     backlog: Vec<Indexed<E>>,
     live: tokio::sync::broadcast::Receiver<Indexed<E>>,
     serialize: F,
@@ -143,7 +226,7 @@ where
         yield Ok(Event::default().comment("connected"));
 
         // 1) Replay the backlog. Each delivered item advances the
-        //    subscription cursor so compaction can release it.
+        //    subscription cursor; the redelivery window still retains it.
         for item in backlog {
             {
                 let mut g = log.lock().expect("event log mutex poisoned");
@@ -179,8 +262,8 @@ where
                     // this `sub_id` forever). Break instead — ending
                     // the stream marks the handle disconnected with
                     // its cursor UN-advanced past the gap, so the
-                    // client reconnect (same `sub_id` only — the
-                    // cursor is server-side, never sent by the client)
+                    // client reconnect (same `sub_id`, optionally with
+                    // its last-received event index)
                     // replays gap-free from the retained log via
                     // `attach`, or receives `409 needs_snapshot` if
                     // the gap fell out of the retained buffer.
@@ -192,8 +275,9 @@ where
 
         // 3) Stream ended (client gone / server shutdown / superseded):
         //    start the disconnect TTL so a reconnect within the grace
-        //    window resumes gap-free. Epoch-gated: a superseded stream
-        //    must NOT start a TTL on the handle that replaced it.
+        //    window resumes from retained events. Epoch-gated: a
+        //    superseded stream must NOT start a TTL on the handle that
+        //    replaced it.
         {
             let mut g = log.lock().expect("event log mutex poisoned");
             g.disconnect(&sub_id, epoch, Instant::now());

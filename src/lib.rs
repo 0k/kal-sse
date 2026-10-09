@@ -1,171 +1,119 @@
-//! `kal-sse` — resilient Server-Sent Events as snapshot + cursor data
-//! channels.
+//! `kal-sse` implements resilient Server-Sent Events as snapshot plus
+//! cursor data channels.
 //!
-//! # The contract
+//! # Contract
 //!
-//! A *data channel* pairs a REST snapshot with an SSE update stream:
+//! A data channel is a REST snapshot and an SSE stream. A `sub_id`
+//! identifies one logical subscription to one data flow, not a tab,
+//! window, or application. The snapshot calls [`EventLog::register`] or
+//! [`EventLog::register_at`], which mints or adopts the id, supersedes a
+//! prior handle, records the snapshot index as its base, and sets the
+//! server cursor to that base. Its TTL starts at registration and lasts
+//! until the first attach.
 //!
-//! * **REST snapshot** establishes the client's starting position — a
-//!   monotonic cursor index `N` on the channel.
-//! * **SSE stream** then delivers every update after `N`, in order,
-//!   each tagged with its own index so the client always knows where
-//!   it is.
+//! A stream request carries `?sub=<uuid>` and may carry a last-applied
+//! event id in `last_event_id` or `Last-Event-ID`. The resume point is
+//! that id, capped at the server cursor; an id below the snapshot base
+//! gets `409 needs_snapshot`, since that client never saw the current
+//! snapshot. Without an id, the resume point is the server cursor. A
+//! `sub_id` belongs to one client at a time. The server atomically replays retained events
+//! and attaches to live events. Every SSE event carries `id: <index>`.
 //!
-//! A client identifies itself to a channel with a **subscription id**
-//! (`sub_id`) — one per logical subscription to one data flow, NOT per
-//! tab / window / app. As an SPA navigates, some channel subscriptions
-//! close, some open, some reconnect; each is its own `sub_id`.
+//! # Why resilient
 //!
-//! # Why "resilient"
+//! [`EventLog::advance`] records hand-off to the HTTP stack, not client
+//! application. A successful socket write places bytes in the server
+//! kernel send buffer; it does not prove client receipt or application.
+//! The server cursor is therefore an upper bound. A reconnect supplies
+//! the client's last applied id to replay events handed into a dead
+//! connection.
 //!
-//! The cursor is **delivery-driven**: sending the `N -> N+1` event *is*
-//! the state transfer. Once the server has emitted that event to a
-//! subscription, the subscription is authoritatively at `N+1` — no
-//! ack, no heartbeat, no re-snapshot. This is what lets the server
-//! retain *exactly* the set of events some live subscription might
-//! still need, and no more.
-//!
-//! When a subscription's SSE stream drops, the server keeps its handle
-//! for a TTL (chosen by the server in [`EventLog::new`]; 15 minutes is
-//! a reasonable value). A reconnect with the same `sub_id` (carrying no
-//! index — the cursor lives on the server) resumes **gap-free**: the
-//! server replays from the cursor it still holds for that `sub_id`,
-//! then attaches to live. The same TTL bounds the wait between the
-//! snapshot and the first SSE attach, so a snapshot whose stream never
-//! connects does not leak its handle.
-//!
-//! The client must re-snapshot when the server no longer holds the
-//! cursor:
-//!
-//! * [`AttachError::UnknownSub`] — the handle is gone: the TTL lapsed
-//!   and [`EventLog::compact`] reclaimed it, the server restarted, or
-//!   the `sub_id` was never registered.
-//! * [`AttachError::Expired`] — the handle exists but the events after
-//!   its cursor were dropped by the `max_events` hard cap.
+//! Sent events remain replayable for [`DEFAULT_REDELIVERY_WINDOW`] after
+//! being sent, subject to handle TTL and `max_events`; configure it with
+//! [`EventLog::with_redelivery_window`]. A resume gets a complete replay
+//! or [`AttachError::Expired`] and must take a new snapshot, never a
+//! silent gap.
 //!
 //! ## Delivery boundary
 //!
-//! "Delivered" means handed to the HTTP stack: the `axum` adapter
-//! advances the cursor when it yields an event to the response body,
-//! with no acknowledgement from the client. Events still buffered in
-//! the HTTP server or the kernel when the connection breaks are lost
-//! for that subscription: the reconnect resumes after them. A client
-//! that needs certainty can check that the `id:` values it receives are
-//! contiguous and re-take the snapshot (proposing the same `sub_id`) on
-//! a gap.
+//! The axum adapter advances immediately before yielding an event to its
+//! response body, and calls [`EventLog::disconnect`] when the stream ends.
+//! An attached handle never expires by TTL. Once detached,
+//! [`EventLog::compact`] reclaims it after TTL.
 //!
-//! # Layers
+//! ## Layers
 //!
-//! * [`core`] — framework-agnostic. The [`EventLog`] data structure,
-//!   the subscription registry, cursor advancement, compaction, and the
-//!   [`AttachError`] error. No HTTP, no axum, no `serde`.
-//! * `axum` (feature `axum`) — a thin adapter turning a channel
-//!   subscription into an `axum` SSE response: `?sub=<uuid>` lookup of
-//!   the server-side cursor, `409 needs_snapshot` on unknown / expired
-//!   sub, the `id:` field, the `x-snapshot-index` header constant, and
-//!   keep-alive.
-//!
-//! The core never depends on the adapter; the adapter is opt-in so the
-//! data structure stays reusable outside any web framework.
+//! * [`core`] owns indexes, handles, snapshot bases, cursor advancement,
+//!   atomic replay plus live attachment, retention, and [`AttachError`].
+//! * `axum`, behind the `axum` feature, parses resume ids, renders `id:`
+//!   events, sends `409 needs_snapshot`, keeps the stream alive, and
+//!   disconnects it when it ends.
 //!
 //! # Wire exchange
 //!
-//! Happy path (first connect) and gap-free reconnect in one diagram:
-//!
 //! ```text
-//! Client                              Server
-//!   |                                   |
-//!   |  GET /api/things                  |
-//!   |---------------------------------->|
-//!   |                                   | register(None) -> ("3f2a…", 42)
-//!   |  200 OK                           |
-//!   |  x-snapshot-index: 42             |
-//!   |  { …body…, sub: "3f2a…" }         |
+//! Client                                Server
+//!   | GET /things                       |
+//!   |---------------------------------->| register(None) -> (sub, 42)
+//!   | 200 {sub}, x-snapshot-index: 42   |
+//!   |<----------------------------------|
+//!   | GET /things/stream?sub=sub&       |
+//!   |   last_event_id=42                |
+//!   |---------------------------------->| attach_from(sub, Some(42))
+//!   | id: 43                            | advance(43), handed to HTTP stack
+//!   |<----------------------------------| [client never applies 43; link dies]
+//!   | GET /things/stream?sub=sub&       |
+//!   |   last_event_id=42                |
+//!   |---------------------------------->| attach_from(sub, Some(42))
+//!   | id: 43                            | replay
 //!   |<----------------------------------|
 //!   |                                   |
-//!   |  GET /api/things/stream?sub=3f2a… |
-//!   |---------------------------------->|
-//!   |                                   | attach("3f2a…") -> backlog, live
-//!   |  200 OK (SSE stream)              |
-//!   |<----------------------------------|
-//!   |  id: 43 / data: {…}              | advance(…, 43)
-//!   |<----------------------------------|
-//!   |  : ping                           |  (every 15 s)
-//!   |<----------------------------------|
-//!   |                                   |
-//!   |  [network drop]                   |
-//!   |  X---------------------------------| disconnect(…, epoch, now)
-//!   |                                   |   TTL countdown starts
-//!   |                                   |   (events 44, 45 appended)
-//!   |                                   |
-//!   |  GET /api/things/stream?sub=3f2a… |  (same sub_id, no index)
-//!   |---------------------------------->|
-//!   |                                   | attach("3f2a…") -> backlog=[44,45]
-//!   |  200 OK (SSE stream)              |
-//!   |<----------------------------------|
-//!   |  id: 44 / data: {…}              | advance(…, 44)
-//!   |  id: 45 / data: {…}              | advance(…, 45)
-//!   |<----------------------------------|
-//!   |  (live tail continues…)           |
-//!   |                                   |
-//!   |  [TTL lapsed / server restart]    |
-//!   |  GET /api/things/stream?sub=3f2a… |
-//!   |---------------------------------->|
-//!   |                                   | attach("3f2a…") -> UnknownSub
-//!   |  409 Conflict                     |
-//!   |  {"error":"needs_snapshot",…}     |
-//!   |<----------------------------------|
-//!   |  GET /api/things?sub=3f2a…        |  (propose same sub_id)
-//!   |---------------------------------->|
-//!   |                                   | register(Some("3f2a…")) -> (…, 51)
-//!   |  200 OK / x-snapshot-index: 51    |
-//!   |<----------------------------------|
-//!   |  GET /api/things/stream?sub=3f2a… |
-//!   |---------------------------------->|
-//!   |  200 OK (SSE stream from 51)      |
+//!   | GET /things/stream?sub=forgotten  |
+//!   |---------------------------------->| AttachError::UnknownSub
+//!   | 409 {"error":"needs_snapshot"}   |
 //!   |<----------------------------------|
 //! ```
 //!
+//! Re-registering or re-attaching increments an epoch. A superseded
+//! stream's advance and disconnect are no-ops; it stops when its next
+//! live event observes the new epoch.
+//!
 //! # Client contract
 //!
-//! This is a cooperating-client protocol. A native browser `EventSource`
-//! is not sufficient: per the WHATWG spec, any non-200 response
-//! (including the `409`) permanently closes the connection with no
-//! retry and no status code in the error event. The client must wrap
-//! `EventSource` or use a fetch-based SSE reader.
+//! 1. Get a snapshot, proposing a stored `sub_id`; render it, store the
+//!    returned id, and take the snapshot index (`x-snapshot-index`) as
+//!    the last applied id: an id older than the snapshot gets a `409`.
+//! 2. Open `GET <stream>?sub=<uuid>&last_event_id=<last applied id>`.
+//! 3. Apply events in order and remember each applied `id`.
+//! 4. After a drop, reconnect with the same id and last applied id in the
+//!    query or header.
+//! 5. On `409 needs_snapshot`, or a browser `EventSource` reconnect that
+//!    never opens and hides the status, return to step 1 with the same id.
 //!
-//! Client loop:
-//!
-//! 1. `GET` snapshot endpoint (optionally proposing a stored `sub_id`).
-//!    Render the body as current state. Store the returned `sub_id`.
-//! 2. Open SSE: `GET <stream>?sub=<sub_id>`.
-//! 3. Apply each event in order. (`id:` is diagnostic — never echo it
-//!    to the server; see *Delivery boundary* for the gap check.)
-//! 4. On stream drop: reconnect with the same `sub_id` (step 2).
-//!    Within TTL → gap-free resume.
-//! 5. On `409 needs_snapshot`: go to step 1, proposing the same `sub_id`.
-//!
-//! The client never tracks or sends an index. The server holds the cursor.
+//! An `EventSource` cannot set headers. Browser retries supply
+//! `Last-Event-ID`; a newly created `EventSource` must use
+//! `?last_event_id=<n>`. The header wins when both are present. Malformed
+//! values produce `400 bad_last_event_id`. The adapter's `sse_response`
+//! accepts no id and uses only the server cursor, so it cannot recover
+//! events lost after a silent disconnect; use `sse_response_from`.
 //!
 //! # Limits
 //!
-//! * **In-memory, single-process.** A server restart loses the registry.
-//!   Every client gets `409 needs_snapshot` on its next SSE request and
-//!   re-takes the snapshot (handled by design; thundering-herd on restart
-//!   is the cost).
-//! * **Not horizontally scalable as-is.** The registry is process-local;
-//!   no shared-store backend is provided.
-//! * **Slowest handle pins the buffer.** The retention floor is the
-//!   minimum cursor over all live and within-TTL handles. The
-//!   `max_events` hard cap is the escape valve: once hit, the lagging
-//!   subscriber gets `AttachError::Expired` on resume.
+//! Handles and events are in-memory and process-local, so restart and
+//! multi-instance deployments require resnapshots or an external shared
+//! implementation. Retention keeps events after the lowest surviving
+//! resume floor plus recent sent events during the redelivery window.
+//! `max_events` is a hard memory cap and can force `needs_snapshot`.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod core;
 
-pub use crate::core::{new_sub_id, AttachError, Cursor, Epoch, EventLog, Indexed, Replay, SubId};
+pub use crate::core::{
+    new_sub_id, AttachError, Cursor, Epoch, EventLog, Indexed, Replay, SubId,
+    DEFAULT_REDELIVERY_WINDOW,
+};
 
 #[cfg(feature = "axum")]
 #[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
