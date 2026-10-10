@@ -31,10 +31,12 @@ pub const DEFAULT_REDELIVERY_WINDOW: Duration = Duration::from_secs(60);
 /// Stable identifier for one logical subscription to one data channel.
 ///
 /// One per data flow a client subscribes to — NOT per tab / window /
-/// app. The client mints it when it first subscribes to the channel
-/// (after taking a REST snapshot) and reuses it on every reconnect to
-/// the same channel so the server can refresh the existing handle
-/// rather than leak a new one.
+/// app, and held by one client at a time. The server mints it at the
+/// first snapshot ([`EventLog::register`] with `None`); the client
+/// proposes it again on every later snapshot and sends it on every
+/// stream request, so the server refreshes the existing handle rather
+/// than leak a new one. A proposed id that is not a hyphenated UUID is
+/// ignored and a fresh one minted.
 pub type SubId = String;
 
 /// An event paired with the monotonic index at which it was appended.
@@ -325,10 +327,11 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     /// born or reset. Both the snapshot base and server cursor are reset
     /// to `last_index`; a later resume hint cannot rewind below this base.
     ///
-    /// * `sub_id` — `Some(id)` to adopt a client-proposed id (which
-    ///   **supersedes any prior handle** for that id — invalidating the
-    ///   prior subscription to this data flow), or `None` to mint a
-    ///   fresh UUID.
+    /// * `sub_id` — `Some(id)` to adopt a client-proposed hyphenated UUID
+    ///   (which **supersedes any prior handle** for that id —
+    ///   invalidating the prior subscription to this data flow), or
+    ///   `None` to mint a fresh UUID. A proposed id that is not a
+    ///   hyphenated UUID is ignored and a fresh one minted.
     ///
     /// Returns the effective `sub_id` (minted or adopted) and the
     /// cursor it was pinned at (`last_index` — the client is current up
@@ -351,7 +354,7 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     /// clock as [`disconnect`](Self::disconnect) and
     /// [`compact`](Self::compact)).
     pub fn register_at(&mut self, sub_id: Option<String>, now: Instant) -> (SubId, Cursor) {
-        let id = sub_id.unwrap_or_else(new_sub_id);
+        let id = sub_id.filter(|id| is_sub_id(id)).unwrap_or_else(new_sub_id);
         let cursor = self.last_index;
         let epoch = self.allocate_epoch();
         self.handles.insert(
@@ -596,6 +599,11 @@ impl<E: Clone + Send + 'static> EventLog<E> {
     }
 }
 
+/// Whether `id` is a hyphenated UUID, the only accepted `sub_id` shape.
+fn is_sub_id(id: &str) -> bool {
+    id.len() == 36 && uuid::Uuid::try_parse(id).is_ok()
+}
+
 /// Mint a fresh UUID-shaped subscription id (v4, random).
 ///
 /// Kept as a free function (not requiring an `EventLog`) so callers
@@ -609,6 +617,8 @@ pub fn new_sub_id() -> SubId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UUID: &str = "0f3c9a52-1b7e-4d2a-9c6e-8a1f2b3c4d5e";
 
     fn log() -> EventLog<u32> {
         // Generous TTL/cap; tests drive time explicitly via `now`.
@@ -694,8 +704,8 @@ mod tests {
         let mut l = log();
         l.append(10);
         l.append(20);
-        let (id, cursor) = l.register(Some("my-sub".to_string()));
-        assert_eq!(id, "my-sub");
+        let (id, cursor) = l.register(Some(UUID.to_string()));
+        assert_eq!(id, UUID);
         assert_eq!(cursor, 2);
     }
 
@@ -705,13 +715,13 @@ mod tests {
         // the old epoch is no longer current.
         let mut l = log();
         l.append(1);
-        let (id, _) = l.register(Some("dup".to_string()));
+        let (id, _) = l.register(Some(UUID.to_string()));
         // Grab the first epoch by attaching.
         let ep1 = l.attach(&id).unwrap().epoch;
         // Re-register the same id (client proposed it again) -> supersede.
-        l.register(Some("dup".to_string()));
+        l.register(Some(UUID.to_string()));
         assert!(
-            !l.is_current("dup", ep1),
+            !l.is_current(UUID, ep1),
             "prior attach is no longer current after re-register"
         );
         assert_eq!(l.handle_count(), 1, "still a single handle for the id");

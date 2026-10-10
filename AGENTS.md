@@ -18,8 +18,9 @@ A *data channel* = REST snapshot + SSE stream. One `sub_id` identifies
 one logical subscription to one data flow, not a tab/window/app.
 
 - **REST snapshot = subscription birth/reset.** The snapshot endpoint
-  takes an optional client-proposed `sub_id` (UUID-shaped): `None` →
-  the server mints one; `Some(id)` → the server adopts it AND
+  takes an optional client-proposed `sub_id`: `None` (or an id that is
+  not a hyphenated UUID) → the server mints one; `Some(id)` → the
+  server adopts it AND
   supersedes any prior handle for that id (invalidating the prior
   subscription to this data flow). `register(sub_id)` or
   `register_at(sub_id, now)` records the current `last_index` as the

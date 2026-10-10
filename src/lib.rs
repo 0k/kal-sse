@@ -6,7 +6,7 @@
 //! A data channel is a REST snapshot and an SSE stream. A `sub_id`
 //! identifies one logical subscription to one data flow, not a tab,
 //! window, or application. The snapshot calls [`EventLog::register`] or
-//! [`EventLog::register_at`], which mints or adopts the id, supersedes a
+//! [`EventLog::register_at`], which mints the id or adopts a proposed hyphenated UUID, supersedes a
 //! prior handle, records the snapshot index as its base, and sets the
 //! server cursor to that base. Its TTL starts at registration and lasts
 //! until the first attach.

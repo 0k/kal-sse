@@ -116,6 +116,19 @@ fn last_event_id_below_the_snapshot_needs_a_new_snapshot() {
 }
 
 #[test]
+fn a_proposed_sub_id_that_is_not_a_uuid_is_replaced_by_a_minted_one() {
+    let mut log = EventLog::<u32>::new(TTL, 256, 64);
+    let proposed = "0f3c9a52-1b7e-4d2a-9c6e-8a1f2b3c4d5e".to_string();
+
+    let (adopted, _) = log.register(Some(proposed.clone()));
+    let (minted, _) = log.register(Some("x".repeat(1 << 20)));
+
+    assert_eq!(adopted, proposed);
+    assert_eq!(minted.len(), 36);
+    assert!(log.attach(&minted).is_ok());
+}
+
+#[test]
 fn many_sends_within_the_window_stay_cheap() {
     // Each advance must not rescan every send record of the window
     // (quadratic, under the log's lock).

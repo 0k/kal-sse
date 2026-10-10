@@ -34,7 +34,8 @@ A *data channel* pairs a REST snapshot with an SSE update stream. One
 tab, window, or application.
 
 The snapshot is subscription birth or reset. =register(sub_id)= and
-=register_at(sub_id, now)= mint or adopt the id, supersede any prior
+=register_at(sub_id, now)= mint the id or adopt a proposed hyphenated
+UUID (anything else is replaced by a fresh id), supersede any prior
 handle, record the current index as the snapshot base, and set the
 server cursor to that base. TTL starts at registration and lasts until
 the first stream attach.
