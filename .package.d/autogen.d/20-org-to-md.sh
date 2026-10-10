@@ -19,6 +19,8 @@
 ## Lua filter: convert org-mode ``:no_run yes`` (and friends) on a
 ## rust block to the ```` ```rust,no_run ```` fence rustdoc expects
 ## instead of pandoc's ``{.rust .no_run}`` attribute syntax.
+## Lua patterns are literal, not shell expansions.
+# shellcheck disable=SC2016
 RUSTDOC_ATTRS_LUA='
 function CodeBlock(el)
   if el.classes[1] == "rust" then
@@ -42,7 +44,42 @@ function CodeBlock(el)
   end
   return el
 end
+function Pandoc(doc)
+  if doc.meta.title then
+    doc = doc:walk {
+      Header = function(el)
+        el.level = el.level + 1
+        return el
+      end
+    }
+    table.insert(doc.blocks, 1, pandoc.Header(1, doc.meta.title))
+  end
+  return doc
+end
 '
+
+## Shift ATX headings, but not examples inside backtick/tilde fences.
+org_to_md_shift_changelog() {
+    awk '
+    {
+      text = $0
+      sub(/^   |^  |^ /, "", text)
+      if (text ~ /^```+/ || text ~ /^~~~+/) {
+        char = substr(text, 1, 1)
+        run = text
+        if (char == "`") sub(/[^`].*$/, "", run)
+        else sub(/[^~].*$/, "", run)
+        if (!fence) { fence = char; width = length(run) }
+        else if (char == fence && length(run) >= width &&
+                 substr(text, length(run) + 1) ~ /^[[:space:]]*$/) fence = ""
+        print
+        next
+      }
+      if (!fence && $0 ~ /^[ ]?[ ]?[ ]?#+([[:space:]]|$)/)
+        sub(/#/, "##")
+      print
+    }' "$1"
+}
 
 if [ -f README.org ]; then
     depends_soft pandoc || {
@@ -63,15 +100,26 @@ if [ -f README.org ]; then
         else
             echo "" >> README.md.tmp
             echo "" >> README.md.tmp
-            gitchangelog >> README.md.tmp || {
-                rm -f README.md.tmp
+            changelog_tmp=$(mktemp) || return 1
+            gitchangelog > "$changelog_tmp" || {
+                rm -f "$changelog_tmp" README.md.tmp
                 return 1
             }
+            if grep -qi '^#+TITLE:' README.org; then
+                org_to_md_shift_changelog "$changelog_tmp" >> README.md.tmp
+            else
+                cat "$changelog_tmp" >> README.md.tmp
+            fi
+            rm -f "$changelog_tmp"
         fi
     elif [ -f CHANGELOG.md ]; then
         echo "" >> README.md.tmp
         echo "" >> README.md.tmp
-        cat CHANGELOG.md >> README.md.tmp
+        if grep -qi '^#+TITLE:' README.org; then
+            org_to_md_shift_changelog CHANGELOG.md >> README.md.tmp
+        else
+            cat CHANGELOG.md >> README.md.tmp
+        fi
     fi
 
     if [ -f README.md ] && diff README.md README.md.tmp > /dev/null; then
