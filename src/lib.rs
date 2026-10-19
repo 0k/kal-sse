@@ -112,6 +112,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod core;
+pub mod mux;
 
 pub use crate::core::{
     new_sub_id, AttachError, Cursor, Epoch, EventLog, Indexed, Replay, SubId,
@@ -121,3 +122,7 @@ pub use crate::core::{
 #[cfg(feature = "axum")]
 #[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
 pub mod axum;
+
+#[cfg(feature = "axum")]
+#[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
+pub mod mux_axum;

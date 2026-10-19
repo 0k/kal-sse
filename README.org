@@ -24,7 +24,7 @@ cargo add kal-sse --features axum
 Or add this dependency:
 
 #+begin_src toml
-kal-sse = { version = "0.2", features = ["axum"] }
+kal-sse = { version = "0.3", features = ["axum"] }
 #+end_src
 
 * What it is
@@ -318,6 +318,100 @@ replay or =409 needs_snapshot=.
   process-local.
 - *Slowest surviving handle pins retention.* The hard cap bounds memory
   by making old backlogs expire.
+
+* Multiplexed connections
+
+Carrying many channels over one SSE connection, with in-stream
+snapshots and live add/remove of channels, is implemented in =mux=
+(feature-free core) and =mux_axum= (feature =axum=), as specified in
+[[file:doc/mux.org][doc/mux.org]]. No consumer uses it yet. Existing
+single-channel APIs are unchanged.
+
+Short server setup (the full runnable example is
+[[file:examples/mux.rs][examples/mux.rs]], including curl commands):
+
+#+begin_example
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use kal_sse::{EventLog, mux::{Channel, Mux, MuxConfig, MuxSource}};
+
+let counter = Arc::new(Channel::new(
+    0_u64,
+    EventLog::new(Duration::from_secs(900), 1024, 16),
+    |value| Ok(vec![value.to_string()]), // one serialized JSON snapshot part
+));
+let source = counter.clone();
+let mux = Mux::new(MuxConfig::default())
+    .family("counter", move |_: Option<&str>| {
+        Ok(source.clone() as Arc<dyn MuxSource>)
+    })?;
+let app = axum::Router::new()
+    .nest("/mux", kal_sse::mux_axum::router(mux.clone()));
+
+// Change state and append its delta under the SAME channel lock:
+counter.update(|value, log| {
+    *value += 1;
+    log.append(value.to_string());
+    log.compact(Instant::now());
+});
+mux.compact(Instant::now()); // also run periodically, even without appends
+#+end_example
+
+Existing typed logs do not need to become =EventLog<String>=. A custom
+=MuxSource= can share =Arc<Mutex<EventLog<E>>>= with existing
+single-channel endpoints. Set =serialize: EventSerializer<E>= to an
+=Arc= serializer (for example =Arc::new(u32::to_string)=). The following
+two method bodies illustrate a numeric state behind a separate mutex;
+the remaining source methods delegate to that same typed log:
+
+#+begin_example
+use kal_sse::mux::{erase_replay, open_on_log, ErasedReplay, Opened};
+use kal_sse::{AttachError, Cursor};
+
+fn open_fresh(&self, now: Instant) -> Result<Opened, String> {
+    let state = self.state.lock().expect("state mutex poisoned");
+    let parts = vec![state.to_string()];
+    let mut log = self.log.lock().expect("event log mutex poisoned");
+    // Keep state AND log guards through registration + attachment.
+    open_on_log(&mut log, parts, self.serialize.clone(), now)
+}
+
+fn resume(&self, sub: &str, hint: Option<Cursor>)
+    -> Result<ErasedReplay, AttachError>
+{
+    let replay = self.log.lock().expect("event log mutex poisoned")
+        .attach_from(sub, hint)?;
+    // The typed replay already owns its backlog/live boundary.
+    Ok(erase_replay(replay, self.serialize.clone()))
+}
+#+end_example
+
+Writers must use the same state -> log lock order. Hold every lock under
+which the state and log change from snapshot rendering until
+=open_on_log= returns. For a store that already performs flush -> build
+snapshot -> register, keep its store guard through =attach= too, then
+construct =Opened= with =erase_replay=; do not register a second time.
+Erasure serializes the bounded backlog immediately and live events only
+when received; it spawns no task. Serializers must not re-enter the mux
+or acquire locks held by their caller. =Channel<S>= remains the simple
+single-lock, already-serialized alternative.
+
+The nested routes are =POST /mux= (reserve), =GET /mux/stream?conn=…=
+(stream), =POST /mux/{conn}/channels= (add/remove), and
+=DELETE /mux/{conn}= (release). Protect them with application
+authentication. Snapshots are taken only when the stream attaches, not
+at reservation. Payload strings must contain valid serialized JSON;
+the HTTP adapter embeds them verbatim.
+
+Core callers use =MuxStream::next().await= or =poll_next=; with =axum=
+enabled, it also implements =futures_core::Stream=. Do not prefetch:
+returning a frame is the cursor hand-off boundary. A reconnect supplies
+=resume={"counter":[generation,last_applied_cursor]}= as a URL-encoded
+query parameter. Missing or stale hints trigger a new snapshot only for
+the affected channel. Removal releases the handle immediately; dropping
+the stream starts the connection and channel TTLs. The bounded removal
+acknowledgement queue refuses an overflowing change atomically with
+=429= and a reason; drain the stream and retry that change.
 
 * License
 

@@ -300,6 +300,12 @@ impl<E: Clone + Send + 'static> EventLog<E> {
         self.handles.len()
     }
 
+    /// Release a subscription immediately, invalidating any attached stream.
+    /// Unknown ids are a no-op. Unlike disconnect, this does not wait for TTL.
+    pub fn release(&mut self, sub_id: &str) {
+        self.handles.remove(sub_id);
+    }
+
     /// Raw live broadcast receiver, bypassing the `sub_id` registry.
     ///
     /// This is the escape hatch for **internal** consumers that want
@@ -623,6 +629,21 @@ mod tests {
     fn log() -> EventLog<u32> {
         // Generous TTL/cap; tests drive time explicitly via `now`.
         EventLog::new(Duration::from_secs(900), 256, 64)
+    }
+
+    #[test]
+    fn release_drops_handle_immediately_and_invalidates_its_attach() {
+        let mut l = log();
+        let (id, _) = l.register(None);
+        let epoch = l.attach(&id).unwrap().epoch;
+        l.append(1);
+        l.release(&id);
+        assert_eq!(l.handle_count(), 0);
+        assert!(!l.is_current(&id, epoch));
+        assert_eq!(l.attach(&id).err(), Some(AttachError::UnknownSub));
+        l.release(&id); // Idempotent.
+        l.compact(Instant::now());
+        assert!(l.is_empty());
     }
 
     #[test]

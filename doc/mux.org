@@ -1,0 +1,577 @@
+#+TITLE: kal-sse multiplexed connections — specification
+#+STATUS: IMPLEMENTED in kal-sse (core + axum); not yet used by any consumer
+
+* Status and scope
+
+This document specifies *multiplexed kal-sse*: one SSE connection per
+browser tab carrying many logical data channels, each keeping the full
+kal-sse guarantees (server-held cursor, gap-free resume, no silent
+loss). It extends the single-channel contract described in
+[[file:../README.org][README.org]]; it does not replace it. The
+single-channel adapter (=sse_response=) stays supported, in particular
+for paginated snapshots (see [[*Out of scope][Out of scope]]).
+
+Normative words: MUST, MUST NOT, SHOULD, MAY.
+
+* Motivation
+
+** The HTTP/1.1 connection budget
+
+Browsers allow six concurrent HTTP/1.1 connections per host, shared by
+every tab of the same profile. An SSE response never ends, so each open
+stream permanently holds one of the six slots; every other request
+(actions, detail fetches, pages) competes for what is left. HTTP/2
+would lift the limit, but browsers only speak HTTP/2 over TLS. Applications
+served over plaintext HTTP therefore still need to respect this budget.
+Source for the per-host limit and its SSE consequence:
+[[https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events][MDN SSE guide]];
+HTTP/2 being TLS-only in browsers: [[https://caniuse.com/http2][caniuse]].
+
+** Why not a bare multiplexer
+
+A multiplexed stream that only forwards deltas, with the client
+fetching state separately, reintroduces the snapshot/stream race this
+crate exists to kill: a delta published while the client's snapshot
+request is in flight is applied before the snapshot arrives and is
+then overwritten by it. This spec closes that race by delivering each
+channel's snapshot *inside* the stream, atomically bound to the cursor
+its deltas continue from.
+
+** Why SSE rather than WebSocket
+
+A single WebSocket would also escape the six-slot pool (Chromium keeps
+a separate WebSocket pool,
+[[https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/socket/client_socket_pool_manager.cc][source]];
+WebKit aligned,
+[[https://github.com/WebKit/WebKit/commit/80f4f4ee7deb62df8465a1678d21346fab7c3cb8][commit]]).
+For this traffic (server-to-client, JSON, low volume) both transports
+cost the same CPU and memory. SSE is kept because it reuses this
+crate's adapter, reconnecting SSE clients, plain HTTP tooling
+(=curl -N=), and needs no framing or keep-alive protocol of our own.
+The reservation step below removes the one advantage WebSocket had
+here (commands and events in one ordered pipe). The core
+(=EventLog=) is transport-independent, so a WebSocket adapter can be
+added later without changing this contract.
+
+** Prior art borrowed
+
+- Reservation token before the stream opens, operations over plain
+  HTTP requests: GraphQL over SSE "single connection mode"
+  ([[https://github.com/enisdenjo/graphql-sse/blob/3749c60f11a3dda68a45ea419d654f441dc4cc8f/PROTOCOL.md#L53-L89][protocol]]).
+- Per-subscription recovery failing independently of the connection:
+  Centrifugo
+  ([[https://github.com/centrifugal/centrifugo/blob/a2e08963910cb198b6acd07171bad1687697fffb/internal/unigrpc/unistream/unistream.proto#L115-L126][subscribe result]]).
+- Snapshot bound to the exact cursor its deltas follow: ElectricSQL
+  shapes
+  ([[https://github.com/electric-sql/electric/blob/140a5f4e77b798123922b2131d1495939a355a0f/packages/sync-service/lib/electric/shapes/api.ex#L792-L846][race check]]).
+- A per-join generation that makes late frames of a previous join
+  harmless: Phoenix Channels =join_ref=
+  ([[https://github.com/phoenixframework/phoenix/blob/429796d9ef753c83c3ce93403371dd02ad6af80b/assets/js/phoenix/channel.js#L241-L264][stale-frame guard]]).
+
+No existing Rust crate provides a multiplexed, cursor-retaining SSE
+adapter; the design is built on this crate's =EventLog=.
+
+* Vocabulary
+
+- *Channel* :: one logical data flow: a materialised state plus the
+  ordered events that modify it. Identified by a *channel key*.
+- *Channel key* :: =family= or =family:param=, e.g. =tick=,
+  =room:lobby=, =room:kitchen=. =family= matches
+  =[a-z][a-z0-9_-]*=; =param= is opaque to the protocol and MUST NOT
+  contain =,= (the key is URL- and JSON-safe after percent-encoding).
+- *Family* :: a server-registered provider able to open any channel
+  whose key starts with its name. Parameterised families exist so a
+  client subscribes to exactly what it renders (one room, one
+  counter), never to "everything and filter".
+- *Connection* (=conn=) :: a server-side record owned by one client
+  instance (one browser tab), identified by an opaque unguessable
+  token. It holds the client's *desired channel set* and, per channel,
+  the kal-sse subscription (=sub_id= in that channel's =EventLog=).
+  It outlives any single HTTP stream.
+- *Stream* :: one HTTP SSE response attached to a connection. At most
+  one stream per connection is authoritative at a time.
+- *Generation* (=gen=) :: a number the server assigns each time a
+  channel (re)starts on a connection: when it is added, and when the
+  server re-snapshots it. Generations are unique and strictly
+  increasing per connection, across all its channels.
+
+* Guarantees
+
+G1. *One connection.* All channels of a client instance are carried by
+    one SSE stream. Adding or removing a channel never opens a second
+    stream.
+
+G2. *Only what was asked.* The server emits frames only for channels
+    in the connection's desired set. Granularity is the channel: a
+    channel delivers everything it covers.
+
+G3. *Snapshot barrier.* For each generation of a channel, the server
+    emits exactly one snapshot (possibly split into parts, see
+    [[*Snapshot parts and fairness][Snapshot parts and fairness]]) whose content reflects exactly the
+    events with index ≤ its =cursor=, followed by every event with
+    index > =cursor=, in index order, with no gap and no duplicate.
+
+G4. *No stall on change.* Adding or removing a channel does not
+    interrupt, delay by a reconnect, or replay any other channel.
+
+G5. *Gap-free resume.* After a stream drop, a reconnect to the same
+    connection within the TTL resumes every channel from the last
+    event the client applied (see [[*Resume hints][Resume hints]]), never from
+    a point past it. A channel whose history is no longer retained
+    is re-snapshotted in-stream by the server under a new generation;
+    other channels are unaffected.
+
+G6. *Per-channel failure isolation.* Lag, expiry, or a provider error
+    on one channel affects only that channel.
+
+G7. *Ordering.* Frames of one channel are delivered in order. No
+    ordering is guaranteed between channels.
+
+G8. *No silent failure.* Every refusal (unknown family, invalid key,
+    unknown connection, provider error) is reported with a reason, in
+    the HTTP response of the request that caused it or as a =channel_error=
+    frame for that channel.
+
+* Endpoints
+
+All paths below are relative to the embedding application's mount
+point. =mux_axum::router= serves =POST /=, =GET /stream=,
+=POST /{conn}/channels=, and =DELETE /{conn}=. Bodies are JSON.
+When nested at =/mux= as in [[file:../examples/mux.rs][examples/mux.rs]],
+the reservation URL is =/mux= (no trailing slash); the other routes
+are prefixed with =/mux=.
+
+** Reserve a connection
+
+#+begin_example
+POST /
+{"channels": ["tick", "room:lobby"]}
+
+201 Created
+{"conn": "6c1e…", "gens": {"tick": 1, "room:lobby": 2},
+ "heartbeat_ms": 15000}
+#+end_example
+
+- The server creates the connection record with the requested desired
+  set and assigns one generation per channel. Snapshots are NOT taken
+  yet: they are taken when the stream attaches (see
+  [[*Stream open][Stream open]]), so no state is buffered for a stream that never
+  comes.
+- =channels= MAY be empty.
+- Unknown family or malformed key: =400= with
+  ={"error": "invalid_channel", "channel": …, "reason": …}=; no
+  connection is created (all-or-nothing).
+- The reservation exists before the stream opens; channel operations
+  are therefore valid immediately, with no race against the stream.
+
+** Open the stream
+
+#+begin_example
+GET /stream?conn=6c1e…&resume=%7B%22tick%22%3A%5B1%2C813%5D%7D
+Accept: text/event-stream
+#+end_example
+
+- =resume= (optional) is the URL-encoded JSON object
+  ={"<channel key>": [gen, cursor], …}= described in
+  [[*Resume hints][Resume hints]]. Absent on the first open.
+- Unknown or reclaimed =conn= (TTL lapsed, server restarted): =409=
+  with ={"error": "needs_reservation", "conn": …}=. The client MUST
+  reserve again with its full desired set.
+- A new stream on a =conn= that already has a live stream supersedes
+  it: the older stream ends (same epoch mechanism as single-channel
+  kal-sse).
+
+** Change the channel set
+
+#+begin_example
+POST /6c1e…/channels
+{"add": ["room:kitchen"], "remove": ["room:lobby"]}
+
+200 OK
+{"gens": {"room:kitchen": 3}}
+#+end_example
+
+- Applied atomically with respect to the stream: the stream task
+  observes the whole change at once.
+- Adding a channel already in the set is a no-op and returns its
+  current generation. Removing a channel not in the set is a no-op.
+- The same key in both =add= and =remove=: =400=.
+- Unknown =conn=: =409 needs_reservation=.
+- Allowed whether or not a stream is currently attached.
+- If the bounded command/acknowledgement queue of a live stream is
+  full, the server MAY refuse the whole change with =429= and
+  ={"error":"control_queue_full","reason":…}=. No part of the
+  change is applied; the client drains the stream and retries.
+
+** Release a connection
+
+#+begin_example
+DELETE /6c1e…
+204 No Content
+#+end_example
+
+Releases every channel subscription immediately. Clients SHOULD call it
+on page unload (=navigator.sendBeacon= is acceptable); the TTL covers
+clients that cannot.
+
+* Stream frames
+
+Every frame is one SSE event with a fixed =event:= name and a JSON
+=data:= envelope. The SSE =id:= field is NOT used: cursors are
+per-channel, so a single =Last-Event-ID= cannot describe the client's
+position. Per-channel positions travel in the =resume= parameter
+instead.
+
+** =hello=
+
+First frame of every stream.
+
+#+begin_example
+event: hello
+data: {"conn":"6c1e…","heartbeat_ms":15000}
+#+end_example
+
+** =snapshot=
+
+#+begin_example
+event: snapshot
+data: {"ch":"tick","gen":1,"cursor":812,"part":0,"last":true,"data":{"value":812}}
+#+end_example
+
+- Starts (or restarts) the channel at generation =gen=. On receipt of
+  =part= 0 the client discards any state it holds for =ch= and any
+  frames of a lower generation.
+- =data= is the provider's snapshot payload, embedded verbatim.
+- =part= counts from 0; =last= marks the final part. The client applies
+  the snapshot once =last= is received.
+
+** =delta=
+
+#+begin_example
+event: delta
+data: {"ch":"tick","gen":1,"cursor":813,"data":{"value":813}}
+#+end_example
+
+- One channel event. =cursor= is its index in the channel's log. The
+  client records the =cursor= of the last frame it *applied* (the
+  snapshot's =cursor= until a delta is applied) and sends it back on
+  reconnect.
+
+** =removed=
+
+#+begin_example
+event: removed
+data: {"ch":"room:lobby","gen":2}
+#+end_example
+
+Confirms the server stopped the channel. No frame of generation ≤
+=gen= for =ch= follows.
+
+** =channel_error=
+
+#+begin_example
+event: channel_error
+data: {"ch":"room:private","gen":4,"reason":"room access denied"}
+#+end_example
+
+Not named =error=: in a browser, =EventSource.addEventListener('error',
+…)= also receives the connection's own error events, so a client could
+not tell a channel refusal from a dropped connection.
+
+A provider refused or failed to open the channel. The channel stays in
+the desired set but inactive; the client MUST surface =reason= to the
+user where the channel's data is displayed, and MAY remove or re-add
+it.
+
+** Keep-alive
+
+A =: ping= comment every =heartbeat_ms=. The client SHOULD treat
+2 × =heartbeat_ms= without any byte as a dead connection and
+reconnect (a phone that changed network can keep a half-open TCP
+connection indefinitely).
+
+* Server behaviour
+
+** Stream open
+
+Under the connection lock, for each channel in the desired set:
+
+1. If the channel has a live subscription handle: resume it
+   (=EventLog::attach_from=) with the client's hint for that channel
+   when the hint's generation equals the channel's current generation,
+   and with no hint otherwise. Backlog is replayed as =delta= frames
+   under the current generation. If the attach fails
+   (=AttachError::Expired=, e.g. a hint below the snapshot base or
+   history no longer retained), fall through to step 2.
+2. If the handle is unknown or expired: open it fresh (next section)
+   under a NEW generation.
+3. If the channel has never been opened on this connection: open it
+   fresh under the generation assigned at reservation or add time.
+
+** Opening a channel (the snapshot barrier)
+
+Under the channel's lock, as one critical section:
+
+1. render the snapshot of the state,
+2. =register= a subscription (cursor = =last_index=),
+3. =attach= it (live receiver taken first, backlog empty).
+
+Because the three steps share one lock with every =append=, the
+snapshot reflects exactly the events ≤ cursor and the live receiver
+delivers exactly the events > cursor (G3). The provider MUST uphold
+the corresponding application invariant: the state it renders and the
+events it appends change under the same lock.
+
+** Adding and removing while streaming
+
+The stream task receives channel-set changes through an in-process
+command queue fed by the =channels= endpoint.
+
+- *Add*: open the channel fresh (barrier above) and enqueue its
+  snapshot; other channels keep flowing (G4).
+- *Remove*: stop polling the channel, release its subscription
+  immediately (=EventLog::release=, new), emit =removed=.
+
+** Resume hints
+
+The server advances a channel's cursor when it hands a frame to the
+HTTP stack, which proves neither receipt nor application by the
+client: frames written into a connection that dies are lost. The
+server cursor is therefore an upper bound, exactly as in the
+single-channel contract ([[file:../src/lib.rs][lib.rs]], "Why resilient").
+
+- On every reconnect the client sends, for each channel whose current
+  snapshot is complete, =[gen, cursor]= of the last frame it applied.
+- The server resumes from =min(hint, server cursor)= through
+  =attach_from=, so frames handed into the dead connection are
+  replayed, within the redelivery window and the =max_events= cap.
+- A hint whose =gen= is not the channel's current generation is
+  ignored; the hint of a channel that is absent, or whose snapshot was
+  incomplete, means "no hint". In both cases, if the server cursor is
+  not provably what the client holds, the channel is re-snapshotted
+  under a new generation (it never resumes past what the client
+  applied).
+
+  Precisely: with no usable hint the server re-snapshots the channel
+  unless no frame of the current generation was ever handed off
+  (cursor equals base and the snapshot itself was never sent).
+
+** Lag and expiry
+
+- *Broadcast lag* on a channel's live receiver: the cursor was not
+  advanced past the gap. Re-attach that channel from its log; the
+  missed events are replayed as =delta= frames under the same
+  generation. No frame is lost and the other channels continue.
+- *Gap no longer retained* (=AttachError::Expired=): re-open the
+  channel fresh under a new generation; the client receives a new
+  =snapshot=. The server does this itself: no =needs_snapshot= round
+  trip reaches the client in mux mode.
+
+** Snapshot parts and fairness
+
+- The scheduler serves channels round-robin, one frame per channel per
+  turn, so a large snapshot on one channel cannot hold back small
+  deltas on the others beyond one frame each.
+- A provider MAY split a snapshot into parts; each part is one frame
+  in the rotation. A channel's deltas are not emitted before its
+  snapshot's =last= part (G3, G7).
+- The stream is pull-driven: the server produces the next frame only
+  when the HTTP body is ready to send. A slow client therefore causes
+  broadcast lag (handled above), never unbounded buffering in the
+  stream task.
+
+** Retention and lifetimes
+
+- A connection whose stream ended is kept for the TTL (default 15
+  min, same as channel handles), then reclaimed with all its
+  subscriptions.
+- A connection that never attaches a stream is reclaimed after the
+  same TTL.
+- Channel handles follow the single-channel rules: live while the
+  stream is attached, TTL after it drops, released on removal.
+
+* Client behaviour
+
+** State per connection
+
+- =conn= token.
+- Desired set, and per channel: current generation, a *generation
+  floor*, and whether the current snapshot is complete.
+
+** Frame acceptance
+
+For a frame on channel =ch= with generation =g=:
+
+1. Drop it if =ch= is not in the local desired set.
+2. Drop it if =g= < floor(ch).
+3. =snapshot= part 0 with =g= ≥ floor(ch): reset the channel, set
+   current = =g=, floor = =g=.
+4. =snapshot= later part or =delta=: accept only if =g= = current and
+   (for =delta=) the snapshot is complete; otherwise drop.
+
+** Local removal and re-add
+
+- On remove, delete =ch= from the local set immediately (frames
+  already in flight are dropped by rule 1), then send the change.
+- On re-add, set floor(ch) to the generation returned by the
+  =channels= response. A =snapshot= of that generation may arrive
+  before the response; rule 3 accepts it because generations only
+  grow.
+- Concurrent view changes in the same tick SHOULD be coalesced into a
+  single =channels= request.
+
+** Reconnect
+
+- Stream drop: reopen =GET /stream?conn=…&resume=…= with backoff,
+  carrying =[gen, cursor]= of the last applied frame per channel.
+  Channels resume from there (G5).
+- =409 needs_reservation=: reserve again with the full desired set,
+  then open the new stream. All channels restart with snapshots.
+- A native =EventSource= reports no HTTP status on failure; the client
+  MUST use a resilient wrapper or a fetch-based reader so
+  it can distinguish =409= from a network error.
+
+** User-visible failures
+
+Any refused reservation, channel change, or =channel_error= frame is displayed
+where the user triggered or views the data, with the server's
+=reason=. A console log alone does not satisfy G8.
+
+* Rust API sketch (non-normative)
+
+#+begin_src rust
+// A family opens channels for keys "family" or "family:param".
+pub trait MuxFamily: Send + Sync + 'static {
+    fn open(&self, param: Option<&str>) -> Result<Arc<dyn MuxSource>, String>;
+}
+
+// Adapt ANY existing typed EventLog<E>, keeping its original epoch/indexes.
+pub type EventSerializer<E> = Arc<dyn Fn(&E) -> String + Send + Sync + 'static>;
+pub struct ErasedReplay {
+    pub epoch: Epoch,
+    pub backlog: Vec<Indexed<String>>,
+    pub live: ErasedLive, // owns a boxed receiver; serializes only on receipt
+}
+// ErasedLive::poll_recv(&mut self, cx: &mut Context<'_>)
+//     -> Poll<Result<Indexed<String>, broadcast::error::RecvError>>
+
+pub fn erase_replay<E: Clone + Send + 'static>(
+    replay: Replay<E>, serialize: EventSerializer<E>,
+) -> ErasedReplay;
+
+pub struct Opened {
+    pub snapshot: Vec<String>,
+    pub sub_id: SubId,
+    pub cursor: Cursor,
+    pub replay: ErasedReplay,
+}
+
+// Call while holding ALL state/log barrier locks, after rendering the parts.
+// Rejects an empty snapshot before creating a handle; then register_at + attach.
+pub fn open_on_log<E: Clone + Send + 'static>(
+    log: &mut EventLog<E>, snapshot_parts: Vec<String>,
+    serialize: EventSerializer<E>, now: Instant,
+) -> Result<Opened, String>;
+
+// A source keeps its existing application state and typed log, with their own
+// locks. The mux only sees erased snapshots, backlog and lazy live receives.
+pub trait MuxSource: Send + Sync + 'static {
+    fn open_fresh(&self, now: Instant) -> Result<Opened, String>;
+    fn resume(&self, sub_id: &str, hint: Option<Cursor>)
+        -> Result<ErasedReplay, AttachError>;
+    fn is_current(&self, sub_id: &str, epoch: Epoch) -> bool;
+    fn advance(&self, sub_id: &str, epoch: Epoch, cursor: Cursor, now: Instant);
+    fn disconnect(&self, sub_id: &str, epoch: Epoch, now: Instant);
+    fn release(&self, sub_id: &str);
+}
+
+let mux = Mux::new(MuxConfig { ttl, heartbeat, ..MuxConfig::default() })
+    .family("tick", tick_family)?
+    .family("room", room_family)?;
+let app = axum::Router::new().nest("/mux", kal_sse::mux_axum::router(mux));
+#+end_src
+
+For separate state and log locks, hold state -> log (the writers' lock
+order) across render -> register -> attach. A store that already does
+flush -> build snapshot -> register keeps its store guard through attach
+and constructs =Opened= using =erase_replay=; it does not register again.
+Backlog serialization is eager; live serialization is lazy and
+pull-driven, without a forwarding task or queue. Serializers must not
+re-enter the mux or acquire locks already held by their caller. Existing
+=Channel<S>= sources use this erased path internally, unchanged for callers.
+
+=EventLog::release(sub_id)= drops a handle immediately (removal must not
+pin the buffer for a TTL).
+
+* Conformance tests
+
+Server cases 1–15 are required automated tests in this crate. The first
+group runs against the core and the stream task without HTTP; the second
+drives the axum endpoints end to end. Cases 16–17 are obligations for
+embedding clients, not claims of client tests in this Rust repository.
+
+** Core and stream task
+
+1. Barrier: events appended concurrently with an open are delivered
+   exactly once, either inside the snapshot or as deltas, never both,
+   never neither.
+2. Add while streaming: channels A and B stream deltas; adding C
+   delivers C's snapshot then C's deltas, while A and B frames keep
+   arriving between them with no replay and no gap.
+3. Remove while streaming: after =removed=, no frame for the channel;
+   its handle is released (=handle_count= decreases immediately).
+4. Remove then re-add the same key: frames of the old generation are
+   distinguishable (lower =gen=) and the new generation starts with a
+   snapshot.
+5. Lag on one channel (capacity-1 broadcast): the lagging channel
+   replays the missed events as deltas, gap-free; the other channels
+   are not interrupted.
+6. Expiry on one channel (=max_events= exceeded): the channel is
+   re-snapshotted under a new generation; the others are unaffected.
+7. Fairness: a snapshot split into many parts on channel A does not
+   delay a delta on channel B by more than one A part.
+8. Reconnect within TTL with hints: every channel resumes after its
+   hinted cursor; frames handed off after the hint (into the dead
+   connection) are replayed; no snapshot is re-sent for a channel
+   whose history is retained.
+8b. Reconnect with a hint of a stale generation, or no hint after
+    frames were handed off: that channel is re-snapshotted under a new
+    generation; the others resume.
+9. Supersede: a second stream on the same =conn= ends the first; the
+   first's disconnect does not start a TTL on the replacement.
+10. TTL: a connection with no stream for longer than the TTL is
+    reclaimed together with its channel handles.
+
+** HTTP end to end
+
+11. Reserve → stream: =hello= then one snapshot per channel.
+12. =channels= before the stream opens: the stream opens with the
+    updated set; nothing is lost.
+13. Unknown family in a reservation: =400= with the reason, no
+    connection created.
+14. Unknown =conn= on the stream and on =channels=: =409
+    needs_reservation=.
+15. Provider refusal on add: =channel_error= frame with the reason; the other
+    channels continue.
+
+** Client obligations (tested by each client implementation)
+
+16. Clients MUST implement the sequences in
+    [[*Frame acceptance][Frame acceptance]] and [[*Local removal and re-add][Local removal and re-add]], including a
+    snapshot that arrives before the =channels= response.
+17. Clients MUST NOT display an item after its removal when it was added
+    then removed while the client was opening its stream.
+
+* Out of scope
+
+- Paginated snapshots (separate REST pages). They stay on the
+  single-channel REST snapshot + =?sub== contract.
+- Sharing one connection between tabs (a =SharedWorker= could do it;
+  not needed yet). Each tab uses one connection, so two tabs use two
+  of the six slots.
+- Authentication: the embedding application protects the endpoints as
+  it protects its other routes. =conn= tokens MUST be unguessable
+  (UUID v4 or equivalent) since they grant access to a subscription.
+- Persistence across server restarts: connections and handles are
+  in-memory, like single-channel subscriptions; a restart costs one
+  reservation and one snapshot per channel.
