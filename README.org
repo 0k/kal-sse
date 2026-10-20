@@ -324,7 +324,8 @@ replay or =409 needs_snapshot=.
 Carrying many channels over one SSE connection, with in-stream
 snapshots and live add/remove of channels, is implemented in =mux=
 (feature-free core) and =mux_axum= (feature =axum=), as specified in
-[[file:doc/mux.org][doc/mux.org]]. No consumer uses it yet. Existing
+[[file:doc/mux.org][doc/mux.org]]. Async opens and streamed snapshot parts
+keep slow-loading channels independent. Existing
 single-channel APIs are unchanged.
 
 Short server setup (the full runnable example is
@@ -396,11 +397,62 @@ when received; it spawns no task. Serializers must not re-enter the mux
 or acquire locks held by their caller. =Channel<S>= remains the simple
 single-lock, already-serialized alternative.
 
+** Asynchronous and streamed snapshots
+
+Existing =open_fresh= implementations work unchanged: =MuxSource::open=
+wraps them in a future ready on its first poll, preserving synchronous
+attachment timing (the mux polls once when attaching).
+For a slow cache bootstrap, override =open= instead. It returns an owned
+=Send + 'static= future; clone the state needed by that future:
+
+#+begin_example
+use kal_sse::mux::{OpenFuture, SnapshotParts};
+
+fn open(self: Arc<Self>, _attempt_started: Instant) -> OpenFuture {
+    let cache = self.cache.clone();
+    Box::pin(async move {
+        cache.wait_until_ready().await?;
+        // Application method: under the writers' state/log locks, capture
+        // immutable snapshot state, register + attach, then release locks.
+        let mut opened = cache.open_fresh(Instant::now())?;
+        let parts: SnapshotParts = std::mem::take(&mut opened.snapshot).into();
+        Ok(opened.with_snapshot(parts))
+    })
+}
+#+end_example
+
+To produce parts over time, replace the ready =parts= above with
+=SnapshotParts::new(move |cx| receiver.poll_recv(cx))=, where the receiver
+yields =Option<Result<SnapshotPart, String>>= (for example a Tokio mpsc
+receiver owned by the source). The mux creates no task or queue: providers
+can also poll an I/O stream or incremental serializer directly. Each
+=SnapshotPart { data, last }= is one frame; the final part MUST have
+=last: true=. Premature EOF or an error produces =channel_error= with a
+reason, releases the handle, and leaves other channels running.
+
+The source decides when the snapshot barrier happens, normally AFTER
+loading. Every part must describe the SAME immutable state at that cursor,
+not live state read at different times. The log receiver attaches at the
+barrier; deltas wait until the last part and recover from log replay after
+lag. Pending opens/parts yield their scheduler turn to other channels and
+must register the supplied waker. Calls and polls must not block or hold
+source locks across awaits.
+
+Cancellation is ownership-based. Before returning =Opened<SnapshotParts>=,
+the future must release any handles it created if dropped or errored (use
+an RAII guard if taking the barrier before an await). After success, the
+mux owns cleanup. Remove cancels loading/parts, releases the handle and
+emits =removed=; re-add uses a new generation. Disconnect cancels pending
+opens; reconnect retries them under a new generation. A partially delivered
+snapshot also restarts under a new generation on reconnect.
+
+** Routes and delivery
+
 The nested routes are =POST /mux= (reserve), =GET /mux/stream?conn=…=
 (stream), =POST /mux/{conn}/channels= (add/remove), and
 =DELETE /mux/{conn}= (release). Protect them with application
-authentication. Snapshots are taken only when the stream attaches, not
-at reservation. Payload strings must contain valid serialized JSON;
+authentication. Opens start when the stream attaches, not at reservation;
+asynchronous sources may take their snapshot later. Payload strings must contain valid serialized JSON;
 the HTTP adapter embeds them verbatim.
 
 Core callers use =MuxStream::next().await= or =poll_next=; with =axum=

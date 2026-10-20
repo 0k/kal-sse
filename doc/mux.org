@@ -1,5 +1,5 @@
 #+TITLE: kal-sse multiplexed connections — specification
-#+STATUS: IMPLEMENTED in kal-sse (core + axum); not yet used by any consumer
+#+STATUS: IMPLEMENTED in kal-sse (core + axum), including async opens and streamed snapshots
 
 * Status and scope
 
@@ -154,7 +154,7 @@ POST /
 
 - The server creates the connection record with the requested desired
   set and assigns one generation per channel. Snapshots are NOT taken
-  yet: they are taken when the stream attaches (see
+   yet: their opens start when the stream attaches (see
   [[*Stream open][Stream open]]), so no state is buffered for a stream that never
   comes.
 - =channels= MAY be empty.
@@ -303,16 +303,17 @@ Under the connection lock, for each channel in the desired set:
    under the current generation. If the attach fails
    (=AttachError::Expired=, e.g. a hint below the snapshot base or
    history no longer retained), fall through to step 2.
-2. If the handle is unknown or expired: open it fresh (next section)
+2. If the handle is unknown or expired: start opening it fresh (next section)
    under a NEW generation.
-3. If the channel has never been opened on this connection: open it
+3. If the channel has never been opened on this connection: start opening it
    fresh under the generation assigned at reservation or add time.
 
 ** Opening a channel (the snapshot barrier)
 
-Under the channel's lock, as one critical section:
+The source chooses when its snapshot is taken, possibly after asynchronous
+loading. Under the channel's lock, as one critical section:
 
-1. render the snapshot of the state,
+1. render or capture an immutable snapshot of the state,
 2. =register= a subscription (cursor = =last_index=),
 3. =attach= it (live receiver taken first, backlog empty).
 
@@ -322,13 +323,71 @@ delivers exactly the events > cursor (G3). The provider MUST uphold
 the corresponding application invariant: the state it renders and the
 events it appends change under the same lock.
 
+Serialization MAY continue asynchronously from that immutable captured state.
+Every part MUST describe that SAME state at the SAME cursor; parts MUST NOT
+read the changing live state at different times. Registration and live attach
+MUST happen at the snapshot barrier, not before an asynchronous load whose
+result represents a later state. An asynchronous source MUST use the actual
+barrier time for registration, not a stale attempt-start timestamp.
+
+** Asynchronous opens and streamed snapshots
+
+- =MuxSource::open(self: Arc<Self>, now)= returns an owned =OpenFuture= resolving to
+  =Result<Opened<SnapshotParts>, String>=. The default adapts existing
+  =open_fresh= implementations with a future ready on its first poll. The
+  owned receiver makes cancellation before that first poll safe: no handle
+  has been registered. The mux polls once at attachment to preserve existing
+  synchronous timing. =Channel<S>=,
+  =open_on_log= and existing =Opened= struct literals remain supported.
+  An async-only source MAY override =open= without implementing =open_fresh=.
+- The family callback, =open= call, future polls and part polls MUST return
+  promptly. Slow I/O or cache bootstrap belongs in the future, never in a
+  synchronous blocking call. Sources MUST NOT hold a state/log lock across
+  an await or re-enter the mux from callbacks or destructors.
+- The mux polls pending opens and pending parts in its existing round-robin
+  rotation. =Pending= skips that channel, not the whole connection. No task
+  is spawned and no forwarding queue is created. A pending producer MUST
+  register the supplied waker and update it on subsequent polls, so progress
+  wakes the currently polling stream without needing a neighbor or heartbeat.
+- Each =SnapshotPart { data, last }= supplies exactly one frame. =part=
+  numbers start at zero and increase only on hand-off. Explicit =last= means
+  a ready part is sent without waiting for lookahead to the next part.
+  The producer MUST supply at least one part, ending with =last = true=.
+  The mux drops the producer immediately on that part and never polls it again.
+- All snapshot frames of a generation carry the cursor established by its
+  barrier. Its attached receiver and log retain subsequent deltas while
+  opening or parts are pending; the mux MUST NOT emit or advance those deltas
+  until the last snapshot part is handed off. Lag afterwards uses the normal
+  gap-free log replay (or a new generation if history exceeded retention).
+- A failed open or part emits one =channel_error= containing its reason (G8).
+  Premature end before a final part also emits =channel_error=. An empty
+  reason becomes =provider refused the channel=. The channel stays desired
+  but inactive; other channels keep flowing. Any partial snapshot is invalid
+  and the client MUST NOT treat it as complete.
+- Remove drops a pending future or parts producer, releases any mux-owned
+  handle immediately, and emits =removed= for the cancelled generation.
+  Re-add starts a strictly newer generation; no cancelled part or delta may
+  follow its =removed= acknowledgement.
+- Before the open future returns success, the SOURCE owns any handles it
+  creates and MUST release them on cancellation or error, including handles
+  created before a pending await. The future needs a cancellation-safe guard
+  if it takes a barrier before loading finishes. After success, the MUX owns
+  the returned handle and releases it on removal or snapshot error.
+- Disconnect cancels pending opens immediately (rather than leaving an
+  unpolled future owning an attached handle during TTL). Reconnect restarts
+  those attempts under a new generation. Supersede also drops the old
+  pending open. Successfully opened channels follow the existing disconnect
+  and resume rules: incomplete snapshots already handed off restart under a
+  new generation; an unhanded snapshot can retain its parts and reattach.
+  Connection release and TTL reclamation drop all remaining producers.
+
 ** Adding and removing while streaming
 
-The stream task receives channel-set changes through an in-process
-command queue fed by the =channels= endpoint.
+The =channels= endpoint changes the desired set under the connection lock
+and wakes the pull stream. Removal acknowledgements use a bounded queue.
 
-- *Add*: open the channel fresh (barrier above) and enqueue its
-  snapshot; other channels keep flowing (G4).
+- *Add*: start opening the channel fresh (barrier above) on its next
+  scheduler turn; other channels keep flowing (G4).
 - *Remove*: stop polling the channel, release its subscription
   immediately (=EventLog::release=, new), emit =removed=.
 
@@ -459,12 +518,19 @@ pub fn erase_replay<E: Clone + Send + 'static>(
     replay: Replay<E>, serialize: EventSerializer<E>,
 ) -> ErasedReplay;
 
-pub struct Opened {
-    pub snapshot: Vec<String>,
+pub struct Opened<P = Vec<String>> {
+    pub snapshot: P,
     pub sub_id: SubId,
     pub cursor: Cursor,
     pub replay: ErasedReplay,
 }
+// Opened::with_snapshot replaces only the producer, preserving the barrier.
+pub type OpenFuture = Pin<Box<dyn Future<Output =
+    Result<Opened<SnapshotParts>, String>> + Send + 'static>>;
+pub struct SnapshotPart { pub data: String, pub last: bool }
+// SnapshotParts::new accepts an owned Send + 'static poll callback:
+// FnMut(&mut Context<'_>) -> Poll<Option<Result<SnapshotPart, String>>>
+// Vec<String> converts into ready SnapshotParts via Into.
 
 // Call while holding ALL state/log barrier locks, after rendering the parts.
 // Rejects an empty snapshot before creating a handle; then register_at + attach.
@@ -476,7 +542,9 @@ pub fn open_on_log<E: Clone + Send + 'static>(
 // A source keeps its existing application state and typed log, with their own
 // locks. The mux only sees erased snapshots, backlog and lazy live receives.
 pub trait MuxSource: Send + Sync + 'static {
+    fn open(self: Arc<Self>, now: Instant) -> OpenFuture; // ready on first poll
     fn open_fresh(&self, now: Instant) -> Result<Opened, String>;
+    // default open_fresh returns a reason for async-only sources
     fn resume(&self, sub_id: &str, hint: Option<Cursor>)
         -> Result<ErasedReplay, AttachError>;
     fn is_current(&self, sub_id: &str, epoch: Epoch) -> bool;
@@ -561,6 +629,27 @@ embedding clients, not claims of client tests in this Rust repository.
     snapshot that arrives before the =channels= response.
 17. Clients MUST NOT display an item after its removal when it was added
     then removed while the client was opening its stream.
+
+** Async snapshot acceptance ledger
+
+Implemented in =tests/mux_async.rs= (controlled gates, no timing sleeps):
+
+| Contract | Automated test |
+|----------+----------------|
+| Slow A open never blocks B; completion wakes the stream | =slow_open_does_not_delay_neighbor= |
+| Parts interleave; wakes work; loading/part deltas replay once after last | =streamed_parts_interleave_and_hold_deltas= |
+| Remove cancels the future (drop flag), releases its handle; re-add is newer | =removal_cancels_loading_and_readd_is_fresh= |
+| Open and part errors have a reason, release handles, leave neighbors live | =loading_and_parts_errors_are_isolated= |
+| Empty/premature EOF is not a successful snapshot | =premature_end_is_a_channel_error= |
+| Disconnect drops a loading future and its provisional handle | =disconnect_cancels_pending_open= |
+| Load first, then capture the barrier; earlier appends belong in snapshot | =source_can_take_barrier_after_loading= |
+| Removing active parts drops the producer and releases the mux-owned handle | =removal_drops_parts_and_releases_handle= |
+| Ready adapter keeps sync open timing and cursor behavior | =synchronous_source_uses_ready_async_adapter_unchanged= |
+| Cancelling an unpolled default open cannot leak a handle | =cancelled_default_open_cannot_leak_a_handle= |
+
+=tests/mux_axum_e2e.rs::delayed_snapshot_over_http_keeps_neighbor_live=
+drives real TCP/HTTP with delayed sources taking their barrier before OR after
+loading. Existing =mux_core= and =mux_typed= tests remain unchanged.
 
 * Out of scope
 

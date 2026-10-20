@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
@@ -277,12 +277,83 @@ where
 
 /// Snapshot rendering + registration + attachment under the source's barrier
 /// locks. Use [`open_on_log`] with the guards still held after rendering.
-pub struct Opened {
-    /// At least one snapshot part, in order.
-    pub snapshot: Vec<String>,
+pub struct Opened<P = Vec<String>> {
+    /// At least one snapshot part, in order. The default preserves synchronous
+    /// sources; async opens use [`SnapshotParts`].
+    pub snapshot: P,
     pub sub_id: SubId,
     pub cursor: Cursor,
     pub replay: ErasedReplay,
+}
+
+impl<P> Opened<P> {
+    /// Replace snapshot production without changing the established log barrier.
+    /// The replacement MUST describe the same immutable state at `cursor`.
+    pub fn with_snapshot<Q>(self, snapshot: Q) -> Opened<Q> {
+        Opened {
+            snapshot,
+            sub_id: self.sub_id,
+            cursor: self.cursor,
+            replay: self.replay,
+        }
+    }
+}
+
+/// An owned asynchronous open. Before returning `Opened`, the future owns any
+/// registered handles and MUST release them on cancellation or error (RAII).
+/// After success the mux owns their lifecycle. No source locks may cross await.
+pub type OpenFuture =
+    Pin<Box<dyn Future<Output = Result<Opened<SnapshotParts>, String>> + Send + 'static>>;
+
+/// One snapshot frame. Explicit `last` avoids lookahead: a ready part is emitted
+/// immediately even when the next part is not ready yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotPart {
+    pub data: String,
+    pub last: bool,
+}
+
+type PollPart = dyn FnMut(&mut Context<'_>) -> Poll<Option<Result<SnapshotPart, String>>> + Send;
+
+/// Owned, pull-driven snapshot production, without a forwarding task or queue.
+/// Pending producers MUST register the supplied waker. At least one part with
+/// `last = true` is required; premature EOF and errors fail only this channel.
+/// Production stops and the producer is dropped immediately after `last`.
+pub struct SnapshotParts {
+    poll: Box<PollPart>,
+}
+
+impl SnapshotParts {
+    pub fn new(
+        poll: impl FnMut(&mut Context<'_>) -> Poll<Option<Result<SnapshotPart, String>>>
+            + Send
+            + 'static,
+    ) -> Self {
+        Self {
+            poll: Box::new(poll),
+        }
+    }
+
+    pub fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<SnapshotPart, String>>> {
+        (self.poll)(cx)
+    }
+}
+
+impl From<Vec<String>> for SnapshotParts {
+    fn from(parts: Vec<String>) -> Self {
+        let mut parts = parts.into_iter();
+        Self::new(move |_| {
+            Poll::Ready(parts.next().map(|data| {
+                Ok(SnapshotPart {
+                    data,
+                    last: parts.len() == 0,
+                })
+            }))
+        })
+    }
 }
 
 /// Type-erased channel source. Log operations must use the same log lock as
@@ -291,7 +362,38 @@ pub struct Opened {
 /// single-lock case, or [`open_on_log`] under the source's own guards. Typed
 /// sources use [`erase_replay`] after `attach_from` to implement resume.
 pub trait MuxSource: Send + Sync + 'static {
-    fn open_fresh(&self, now: Instant) -> Result<Opened, String>;
+    /// Start promptly; slow work belongs in the returned future. The default
+    /// adapts existing synchronous sources, ready on its first poll. The owned
+    /// receiver makes cancelling even an unpolled adapter safe. The mux polls
+    /// once at attachment to preserve existing synchronous open timing.
+    /// Async-only sources override this method and need not implement open_fresh.
+    /// `now` is the attempt's start time; after waiting, register with a fresh
+    /// Instant at the actual snapshot barrier, not with this stale timestamp.
+    fn open(self: Arc<Self>, now: Instant) -> OpenFuture {
+        Box::pin(async move {
+            let opened = self.open_fresh(now)?;
+            if opened.snapshot.is_empty() {
+                self.release(&opened.sub_id);
+                return Err("snapshot must have at least one part".into());
+            }
+            let Opened {
+                snapshot,
+                sub_id,
+                cursor,
+                replay,
+            } = opened;
+            Ok(Opened {
+                snapshot: snapshot.into(),
+                sub_id,
+                cursor,
+                replay,
+            })
+        })
+    }
+
+    fn open_fresh(&self, _now: Instant) -> Result<Opened, String> {
+        Err("source requires asynchronous open".into())
+    }
     fn resume(&self, sub_id: &str, hint: Option<Cursor>) -> Result<ErasedReplay, AttachError>;
     fn is_current(&self, sub_id: &str, epoch: Epoch) -> bool;
     fn advance(&self, sub_id: &str, epoch: Epoch, cursor: Cursor, now: Instant);
@@ -614,6 +716,7 @@ impl Mux {
                         param: param.map(str::to_owned),
                         source: None,
                         active: None,
+                        loading: None,
                         attempted: false,
                         error: None,
                     },
@@ -710,6 +813,7 @@ struct Entry {
     param: Option<String>,
     source: Option<Arc<dyn MuxSource>>,
     active: Option<Active>,
+    loading: Option<OpenFuture>,
     attempted: bool,
     error: Option<String>,
 }
@@ -722,7 +826,7 @@ impl Entry {
         now: Instant,
     ) {
         if let (Some(source), Some(active)) = (&self.source, &mut self.active) {
-            let usable = hint.filter(|(gen, _)| *gen == self.gen && active.snapshot.is_empty());
+            let usable = hint.filter(|(gen, _)| *gen == self.gen && active.snapshot.is_none());
             if usable.is_some() || !active.handed {
                 if let Ok(replay) = source.resume(&active.sub_id, usable.map(|(_, cursor)| cursor))
                 {
@@ -741,25 +845,44 @@ impl Entry {
         }
         self.attempted = true;
         self.error = None;
-        let opened: Result<Opened, String> = (|| {
-            if self.source.is_none() {
-                self.source = Some(self.family.open(self.param.as_deref())?);
+        if self.source.is_none() {
+            match self.family.open(self.param.as_deref()) {
+                Ok(source) => self.source = Some(source),
+                Err(reason) => {
+                    self.fail(reason);
+                    return;
+                }
             }
-            let source = self.source.as_ref().expect("opened source");
-            let opened = source.open_fresh(now)?;
-            if opened.snapshot.is_empty() {
-                source.release(&opened.sub_id);
-                return Err("snapshot must have at least one part".into());
-            }
-            Ok(opened)
-        })();
+        }
+        self.loading = Some(
+            self.source
+                .as_ref()
+                .expect("opened source")
+                .clone()
+                .open(now),
+        );
+        // Preserve immediate sync-open attachment (including unpolled streams).
+        // Pending futures are polled again with the real stream waker before
+        // the stream can return Pending, so this initial probe cannot lose wakeups.
+        let waker = Waker::from(Arc::new(OpenWake));
+        self.poll_open(&mut Context::from_waker(&waker));
+    }
+
+    fn poll_open(&mut self, cx: &mut Context<'_>) {
+        let Some(loading) = &mut self.loading else {
+            return;
+        };
+        let Poll::Ready(opened) = loading.as_mut().poll(cx) else {
+            return;
+        };
+        self.loading = None;
         match opened {
             Ok(opened) => {
                 let mut active = Active {
                     sub_id: opened.sub_id,
                     epoch: opened.replay.epoch,
                     base: opened.cursor,
-                    snapshot: opened.snapshot.into(),
+                    snapshot: Some(opened.snapshot),
                     part: 0,
                     handed: false,
                     backlog: VecDeque::new(),
@@ -768,17 +891,21 @@ impl Entry {
                 active.set_replay(opened.replay);
                 self.active = Some(active);
             }
-            Err(reason) => {
-                self.error = Some(if reason.is_empty() {
-                    "provider refused the channel".into()
-                } else {
-                    reason
-                });
-            }
+            Err(reason) => self.fail(reason),
         }
     }
 
+    fn fail(&mut self, reason: String) {
+        self.release_active();
+        self.error = Some(if reason.is_empty() {
+            "provider refused the channel".into()
+        } else {
+            reason
+        });
+    }
+
     fn release_active(&mut self) {
+        self.loading = None;
         if let (Some(source), Some(active)) = (&self.source, self.active.take()) {
             source.release(&active.sub_id);
         }
@@ -793,15 +920,16 @@ impl Entry {
         if !self.attempted {
             self.fresh(next_gen, Instant::now());
         }
-        if let Some(reason) = self.error.take() {
-            return Poll::Ready(MuxFrame::Error {
-                ch: key.into(),
-                gen: self.gen,
-                reason,
-            });
-        }
         // One retry only: a continuously mutating provider cannot spin this poll.
         for _ in 0..2 {
+            self.poll_open(cx);
+            if let Some(reason) = self.error.take() {
+                return Poll::Ready(MuxFrame::Error {
+                    ch: key.into(),
+                    gen: self.gen,
+                    reason,
+                });
+            }
             let Some(active) = &mut self.active else {
                 return Poll::Pending;
             };
@@ -810,17 +938,33 @@ impl Entry {
                 self.fresh(next_gen, Instant::now());
                 continue;
             }
-            if let Some(data) = active.snapshot.pop_front() {
+            if let Some(snapshot) = &mut active.snapshot {
+                let item = match snapshot.poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(item))) => item,
+                    Poll::Ready(result) => {
+                        let reason = match result {
+                            Some(Err(reason)) => reason,
+                            None => "snapshot ended before its last part".into(),
+                            Some(Ok(_)) => unreachable!(),
+                        };
+                        self.fail(reason);
+                        continue;
+                    }
+                };
                 let part = active.part;
                 active.part += 1;
                 active.handed = true;
+                if item.last {
+                    active.snapshot = None;
+                }
                 return Poll::Ready(MuxFrame::Snapshot {
                     ch: key.into(),
                     gen: self.gen,
                     cursor: active.base,
                     part,
-                    last: active.snapshot.is_empty(),
-                    data,
+                    last: item.last,
+                    data: item.data,
                 });
             }
             match active.poll_event(cx) {
@@ -861,6 +1005,12 @@ impl Entry {
         cx.waker().wake_by_ref();
         Poll::Pending
     }
+}
+
+struct OpenWake;
+
+impl Wake for OpenWake {
+    fn wake(self: Arc<Self>) {}
 }
 
 impl Drop for Entry {
@@ -908,7 +1058,7 @@ struct Active {
     sub_id: SubId,
     epoch: Epoch,
     base: Cursor,
-    snapshot: VecDeque<String>,
+    snapshot: Option<SnapshotParts>,
     part: usize,
     handed: bool,
     backlog: VecDeque<Indexed<String>>,
@@ -1006,7 +1156,10 @@ impl MuxStream {
             .lock()
             .expect("mux connection mutex poisoned");
         if !connection.released && connection.epoch == self.epoch {
-            for entry in connection.channels.values() {
+            for entry in connection.channels.values_mut() {
+                // A pending open may own a handle not yet visible to the mux.
+                // Dropping it invokes the source's cancellation cleanup.
+                entry.loading = None;
                 if let (Some(source), Some(active)) = (&entry.source, &entry.active) {
                     source.disconnect(&active.sub_id, active.epoch, now);
                 }

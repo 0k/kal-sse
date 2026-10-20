@@ -1,12 +1,14 @@
 #![cfg(feature = "axum")]
 //! Spec cases 11--15: actual TCP/HTTP/SSE, not router-only mocks.
+#[path = "support/async_source.rs"]
+mod async_source;
 mod support;
 
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
-use kal_sse::mux::{Channel, Mux};
+use kal_sse::mux::{Channel, Mux, MuxSource, SnapshotPart};
 use serde_json::{json, Value};
 use support::*;
 
@@ -20,8 +22,17 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    async fn start_with(delayed: Option<Arc<dyn MuxSource>>) -> Self {
         let a = channel(32, 8, 1);
-        let mux = mux(&[("a", a.clone()), ("room", channel(32, 8, 1))]);
+        let mut mux = mux(&[("a", a.clone()), ("room", channel(32, 8, 1))]);
+        if let Some(delayed) = delayed {
+            mux = mux
+                .family("slow", move |_: Option<&str>| Ok(delayed.clone()))
+                .unwrap();
+        }
         let router = axum::Router::new().nest("/custom", kal_sse::mux_axum::router(mux.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/custom", listener.local_addr().unwrap());
@@ -84,6 +95,64 @@ impl Server {
             .await
             .unwrap()
             .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn delayed_snapshot_over_http_keeps_neighbor_live() {
+    for after_load in [false, true] {
+        let state = channel(32, 8, 1);
+        let (source, load, parts) = if after_load {
+            async_source::DelayedSource::after_load(state.clone())
+        } else {
+            async_source::DelayedSource::new(state.clone())
+        };
+        let s = Server::start_with(Some(source)).await;
+        let r = s.reserve(json!(["slow", "a"])).await;
+        let conn = r["conn"].as_str().unwrap();
+        let mut reader = s.open(conn).await;
+        assert_eq!(reader.event().await.0, "hello");
+        assert_eq!(
+            reader.event().await,
+            (
+                "snapshot".into(),
+                json!({"ch":"a","gen":2,"cursor":0,"part":0,"last":true,"data":0})
+            )
+        );
+        append(&s.a, 1);
+        assert_eq!(
+            reader.event().await,
+            (
+                "delta".into(),
+                json!({"ch":"a","gen":2,"cursor":1,"data":1})
+            )
+        );
+        load.send(Ok(())).unwrap();
+        parts
+            .send(Ok(SnapshotPart {
+                data: "0".into(),
+                last: true,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.event().await,
+            (
+                "snapshot".into(),
+                json!({"ch":"slow","gen":1,"cursor":0,"part":0,"last":true,"data":0})
+            )
+        );
+        append(&state, 1);
+        assert_eq!(
+            reader.event().await,
+            (
+                "delta".into(),
+                json!({"ch":"slow","gen":1,"cursor":1,"data":1})
+            )
+        );
+        drop(reader);
+        s.mux.release(conn);
+        s.finish().await;
     }
 }
 
