@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::{AttachError, Cursor, Epoch, EventLog, Indexed, Replay, SubId};
 
@@ -35,6 +35,24 @@ pub type Generation = u64;
 pub type ResumeHints = BTreeMap<String, (Generation, Cursor)>;
 /// Generations assigned by reservation or channel-set changes.
 pub type Generations = BTreeMap<String, Generation>;
+
+/// Caller metadata captured at reservation and immutable for its lifetime.
+/// Tags are application-defined; the mux neither interprets nor authenticates them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnInfo {
+    pub tags: BTreeMap<String, String>,
+}
+
+/// Owned view of one non-expired reservation, including disconnected ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnSnapshot {
+    pub conn: String,
+    pub info: ConnInfo,
+    /// Desired keys in insertion order, independent of stream scheduling.
+    pub channels: Vec<String>,
+    /// Whether an authoritative stream is currently attached.
+    pub attached: bool,
+}
 
 /// Connection lifetime, heartbeat and bounded control acknowledgement queue.
 #[derive(Clone, Debug)]
@@ -160,6 +178,18 @@ pub enum MuxFrame {
 /// connection-wide failure. Parameter validation belongs to the provider.
 pub trait MuxFamily: Send + Sync + 'static {
     fn open(&self, param: Option<&str>) -> Result<Arc<dyn MuxSource>, String>;
+
+    /// Create a source for this reservation's caller. Called lazily at stream
+    /// attachment or when an added channel is first polled, just like `open`.
+    /// Override to choose or construct a caller-specific source. Existing
+    /// families and closure providers keep working through the default.
+    fn open_for(
+        &self,
+        param: Option<&str>,
+        _info: &ConnInfo,
+    ) -> Result<Arc<dyn MuxSource>, String> {
+        self.open(param)
+    }
 }
 
 impl<F> MuxFamily for F
@@ -470,6 +500,7 @@ struct Registry {
     config: MuxConfig,
     families: HashMap<String, Arc<dyn MuxFamily>>,
     connections: Mutex<HashMap<String, Arc<Mutex<Connection>>>>,
+    changes: watch::Sender<u64>,
 }
 
 impl Mux {
@@ -484,6 +515,7 @@ impl Mux {
                 config,
                 families: HashMap::new(),
                 connections: Mutex::new(HashMap::new()),
+                changes: watch::channel(0).0,
             }),
         }
     }
@@ -512,22 +544,48 @@ impl Mux {
     }
 
     pub fn reserve_at(&self, channels: Vec<String>, now: Instant) -> Result<Reservation, MuxError> {
+        self.reserve_with_at(channels, ConnInfo::default(), now)
+    }
+
+    /// Reserve channels with caller metadata, without opening their sources yet.
+    pub fn reserve_with(
+        &self,
+        channels: Vec<String>,
+        info: ConnInfo,
+    ) -> Result<Reservation, MuxError> {
+        self.reserve_with_at(channels, info, Instant::now())
+    }
+
+    /// Explicit-clock variant of [`Self::reserve_with`].
+    pub fn reserve_with_at(
+        &self,
+        channels: Vec<String>,
+        info: ConnInfo,
+        now: Instant,
+    ) -> Result<Reservation, MuxError> {
         let entries = self.validate(&channels)?;
         self.compact(now);
-        let mut connection = Connection::new(now + self.inner.config.ttl);
+        let mut connection = Connection::new(
+            now + self.inner.config.ttl,
+            info,
+            self.inner.changes.clone(),
+        );
         let mut gens = Generations::new();
         for (key, mut entry) in entries {
             entry.gen = allocate(&mut connection.next_gen);
+            entry.insertion_gen = entry.gen;
             gens.insert(key.clone(), entry.gen);
             connection.order.push_back(key.clone());
             connection.channels.insert(key, entry);
         }
         let conn = uuid::Uuid::new_v4().to_string();
-        self.inner
+        let mut registry = self
+            .inner
             .connections
             .lock()
-            .expect("mux registry mutex poisoned")
-            .insert(conn.clone(), Arc::new(Mutex::new(connection)));
+            .expect("mux registry mutex poisoned");
+        registry.insert(conn.clone(), Arc::new(Mutex::new(connection)));
+        connections_changed(&self.inner.changes);
         Ok(Reservation {
             conn,
             gens,
@@ -562,12 +620,16 @@ impl Mux {
         connection.expires_at = None;
         connection.removed.clear();
         let Connection {
-            channels, next_gen, ..
+            channels,
+            next_gen,
+            info,
+            ..
         } = &mut *connection;
         for (key, entry) in channels {
-            entry.attach(hints.get(key).copied(), next_gen, now);
+            entry.attach(hints.get(key).copied(), next_gen, info, now);
         }
         let epoch = connection.epoch;
+        connections_changed(&self.inner.changes);
         drop(connection);
         Ok(MuxStream {
             connection: shared,
@@ -626,6 +688,7 @@ impl Mux {
                 reason: "stream control queue is full; drain the stream and retry".into(),
             });
         }
+        let mut changed = !removals.is_empty();
         for key in removals {
             let entry = connection.channels.remove(&key).expect("checked removal");
             connection.order.retain(|existing| existing != &key);
@@ -642,13 +705,18 @@ impl Mux {
             if let Some(existing) = connection.channels.get(&key) {
                 gens.insert(key, existing.gen);
             } else {
+                changed = true;
                 entry.gen = allocate(&mut connection.next_gen);
+                entry.insertion_gen = entry.gen;
                 gens.insert(key.clone(), entry.gen);
                 connection.order.push_back(key.clone());
                 connection.channels.insert(key, entry);
             }
         }
         connection.wake();
+        if changed {
+            connections_changed(&self.inner.changes);
+        }
         Ok(gens)
     }
 
@@ -665,24 +733,75 @@ impl Mux {
                 .lock()
                 .expect("mux connection mutex poisoned")
                 .release();
+            connections_changed(&self.inner.changes);
         }
     }
 
     /// Reclaim expired reservations and every handle they own. No sleeping.
     pub fn compact(&self, now: Instant) {
-        self.inner
+        let mut registry = self
+            .inner
             .connections
             .lock()
-            .expect("mux registry mutex poisoned")
-            .retain(|_, shared| {
-                let mut connection = shared.lock().expect("mux connection mutex poisoned");
+            .expect("mux registry mutex poisoned");
+        let before = registry.len();
+        registry.retain(|_, shared| {
+            let mut connection = shared.lock().expect("mux connection mutex poisoned");
+            if connection.expires_at.is_some_and(|expiry| expiry <= now) {
+                connection.release();
+                false
+            } else {
+                true
+            }
+        });
+        if registry.len() != before {
+            connections_changed(&self.inner.changes);
+        }
+    }
+
+    /// Snapshot reservations sorted by connection id. Expired reservations are
+    /// excluded even before [`Self::compact`] reclaims them. Desired channels
+    /// include loading or refused sources; filter `attached` for live followers.
+    /// This read does not reclaim handles or publish a change notification.
+    pub fn connections(&self) -> Vec<ConnSnapshot> {
+        let registry = self
+            .inner
+            .connections
+            .lock()
+            .expect("mux registry mutex poisoned");
+        let now = Instant::now();
+        let mut snapshots: Vec<_> = registry
+            .iter()
+            .filter_map(|(conn, shared)| {
+                let connection = shared.lock().expect("mux connection mutex poisoned");
                 if connection.expires_at.is_some_and(|expiry| expiry <= now) {
-                    connection.release();
-                    false
-                } else {
-                    true
+                    return None;
                 }
-            });
+                let mut channels: Vec<_> = connection.channels.iter().collect();
+                channels.sort_by_key(|(_, entry)| entry.insertion_gen);
+                Some(ConnSnapshot {
+                    conn: conn.clone(),
+                    info: connection.info.clone(),
+                    channels: channels.into_iter().map(|(key, _)| key.clone()).collect(),
+                    attached: connection.expires_at.is_none(),
+                })
+            })
+            .collect();
+        snapshots.sort_by(|a, b| a.conn.cmp(&b.conn));
+        snapshots
+    }
+
+    /// Watch the connection revision (initially zero); requires no Tokio runtime.
+    /// Increments once per reserve, effective channel-set change, release,
+    /// stream attach (including supersede), authoritative detach, or compaction
+    /// batch reclaiming expired connections. No-op/refused commands, stale
+    /// stream cleanup and frame delivery do not increment it.
+    ///
+    /// Watch notifications may coalesce; the revision counts mutations, not
+    /// frames. Subscribe before reading [`Self::connections`], then reread after
+    /// `changed().await`. Release watch borrows before calling back into the mux.
+    pub fn subscribe_connections(&self) -> watch::Receiver<u64> {
+        self.inner.changes.subscribe()
     }
 
     pub fn connection_count(&self) -> usize {
@@ -712,6 +831,7 @@ impl Mux {
                     key.clone(),
                     Entry {
                         gen: 0,
+                        insertion_gen: 0,
                         family: provider.clone(),
                         param: param.map(str::to_owned),
                         source: None,
@@ -725,6 +845,14 @@ impl Mux {
         }
         Ok(entries)
     }
+}
+
+fn connections_changed(changes: &watch::Sender<u64>) {
+    changes.send_modify(|revision| {
+        *revision = revision
+            .checked_add(1)
+            .expect("mux connection revision exhausted");
+    });
 }
 
 fn valid_family(name: &str) -> bool {
@@ -768,6 +896,8 @@ fn allocate(next: &mut Generation) -> Generation {
 }
 
 struct Connection {
+    info: ConnInfo,
+    changes: watch::Sender<u64>,
     channels: BTreeMap<String, Entry>,
     order: VecDeque<String>,
     removed: VecDeque<MuxFrame>,
@@ -779,8 +909,10 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(expiry: Instant) -> Self {
+    fn new(expiry: Instant, info: ConnInfo, changes: watch::Sender<u64>) -> Self {
         Self {
+            info,
+            changes,
             channels: BTreeMap::new(),
             order: VecDeque::new(),
             removed: VecDeque::new(),
@@ -809,6 +941,9 @@ impl Connection {
 
 struct Entry {
     gen: Generation,
+    // Generations may change on reconnect; this initial value preserves desired
+    // insertion order independently of the round-robin scheduling queue.
+    insertion_gen: Generation,
     family: Arc<dyn MuxFamily>,
     param: Option<String>,
     source: Option<Arc<dyn MuxSource>>,
@@ -823,6 +958,7 @@ impl Entry {
         &mut self,
         hint: Option<(Generation, Cursor)>,
         next_gen: &mut Generation,
+        info: &ConnInfo,
         now: Instant,
     ) {
         if let (Some(source), Some(active)) = (&self.source, &mut self.active) {
@@ -835,10 +971,10 @@ impl Entry {
                 }
             }
         }
-        self.fresh(next_gen, now);
+        self.fresh(next_gen, info, now);
     }
 
-    fn fresh(&mut self, next_gen: &mut Generation, now: Instant) {
+    fn fresh(&mut self, next_gen: &mut Generation, info: &ConnInfo, now: Instant) {
         self.release_active();
         if self.attempted {
             self.gen = allocate(next_gen);
@@ -846,7 +982,7 @@ impl Entry {
         self.attempted = true;
         self.error = None;
         if self.source.is_none() {
-            match self.family.open(self.param.as_deref()) {
+            match self.family.open_for(self.param.as_deref(), info) {
                 Ok(source) => self.source = Some(source),
                 Err(reason) => {
                     self.fail(reason);
@@ -915,10 +1051,11 @@ impl Entry {
         &mut self,
         key: &str,
         next_gen: &mut Generation,
+        info: &ConnInfo,
         cx: &mut Context<'_>,
     ) -> Poll<MuxFrame> {
         if !self.attempted {
-            self.fresh(next_gen, Instant::now());
+            self.fresh(next_gen, info, Instant::now());
         }
         // One retry only: a continuously mutating provider cannot spin this poll.
         for _ in 0..2 {
@@ -935,7 +1072,7 @@ impl Entry {
             };
             let source = self.source.as_ref().expect("active channel source");
             if !source.is_current(&active.sub_id, active.epoch) {
-                self.fresh(next_gen, Instant::now());
+                self.fresh(next_gen, info, Instant::now());
                 continue;
             }
             if let Some(snapshot) = &mut active.snapshot {
@@ -982,7 +1119,7 @@ impl Entry {
                 Poll::Ready(Err(broadcast::error::RecvError::Lagged(_))) => {
                     match source.resume(&active.sub_id, None) {
                         Ok(replay) => active.set_replay(replay),
-                        Err(_) => self.fresh(next_gen, Instant::now()),
+                        Err(_) => self.fresh(next_gen, info, Instant::now()),
                     }
                 }
                 Poll::Ready(Err(broadcast::error::RecvError::Closed)) => {
@@ -1126,6 +1263,7 @@ impl MuxStream {
             channels,
             order,
             next_gen,
+            info,
             ..
         } = &mut *connection;
         for _ in 0..order.len() {
@@ -1133,7 +1271,7 @@ impl MuxStream {
             let result = channels
                 .get_mut(&key)
                 .expect("desired channel in rotation")
-                .poll(&key, next_gen, cx);
+                .poll(&key, next_gen, info, cx);
             order.push_back(key);
             if let Poll::Ready(frame) = result {
                 return Poll::Ready(Some(frame));
@@ -1166,6 +1304,7 @@ impl MuxStream {
             }
             connection.expires_at = Some(now + self.ttl);
             connection.waker = None;
+            connections_changed(&connection.changes);
         }
         self.ended = true;
     }

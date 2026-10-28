@@ -10,26 +10,47 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use crate::mux::{Mux, MuxError, MuxFrame, ResumeHints};
+use crate::mux::{ConnInfo, Mux, MuxError, MuxFrame, ResumeHints};
+
+#[derive(Clone)]
+struct MuxState {
+    mux: Mux,
+    tagger: Arc<dyn Fn(&HeaderMap) -> ConnInfo + Send + Sync>,
+}
 
 /// Four endpoints with caller-selected mount point; see module documentation.
 pub fn router(mux: Mux) -> Router {
+    router_with_tagger(mux, |_| ConnInfo::default())
+}
+
+/// The same endpoints as [`router`], tagging each reservation from its request
+/// headers. The tagger runs only on reserve: later stream/change headers cannot
+/// replace the stored metadata. Authenticate requests and strip untrusted
+/// identity headers before this router; tags do not enforce access control.
+pub fn router_with_tagger(
+    mux: Mux,
+    tagger: impl Fn(&HeaderMap) -> ConnInfo + Send + Sync + 'static,
+) -> Router {
     Router::new()
         .route("/", post(reserve))
         .route("/stream", get(stream))
         .route("/{conn}/channels", post(channels))
         .route("/{conn}", delete(release))
-        .with_state(mux)
+        .with_state(MuxState {
+            mux,
+            tagger: Arc::new(tagger),
+        })
 }
 
 fn bad_request(reason: impl ToString) -> Response {
@@ -82,7 +103,11 @@ fn strings(body: &Value, field: &str, optional: bool) -> Result<Vec<String>, Str
         .collect()
 }
 
-async fn reserve(State(mux): State<Mux>, body: Result<Json<Value>, JsonRejection>) -> Response {
+async fn reserve(
+    State(state): State<MuxState>,
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
     let body = match body {
         Ok(Json(body)) => body,
         Err(error) => return bad_request(error),
@@ -91,14 +116,14 @@ async fn reserve(State(mux): State<Mux>, body: Result<Json<Value>, JsonRejection
         Ok(keys) => keys,
         Err(error) => return bad_request(error),
     };
-    match mux.reserve(keys) {
+    match state.mux.reserve_with(keys, (state.tagger)(&headers)) {
         Ok(reservation) => (StatusCode::CREATED, Json(json!({"conn": reservation.conn, "gens": reservation.gens, "heartbeat_ms": reservation.heartbeat_ms}))).into_response(),
         Err(error) => refusal(error),
     }
 }
 
 async fn channels(
-    State(mux): State<Mux>,
+    State(MuxState { mux, .. }): State<MuxState>,
     Path(conn): Path<String>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
@@ -120,13 +145,16 @@ async fn channels(
     }
 }
 
-async fn release(State(mux): State<Mux>, Path(conn): Path<String>) -> StatusCode {
+async fn release(
+    State(MuxState { mux, .. }): State<MuxState>,
+    Path(conn): Path<String>,
+) -> StatusCode {
     mux.release(&conn);
     StatusCode::NO_CONTENT
 }
 
 async fn stream(
-    State(mux): State<Mux>,
+    State(MuxState { mux, .. }): State<MuxState>,
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Response {
     let query = match query {

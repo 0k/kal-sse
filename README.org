@@ -446,6 +446,63 @@ emits =removed=; re-add uses a new generation. Disconnect cancels pending
 opens; reconnect retries them under a new generation. A partially delivered
 snapshot also restarts under a new generation on reconnect.
 
+** Connection metadata and observation
+
+~Mux::reserve_with(channels, info)~ stores an immutable
+~ConnInfo { tags: BTreeMap<String, String> }~ on the reservation.
+~reserve_with_at(channels, info, now)~ accepts an explicit clock;
+~reserve~ and ~reserve_at~ still use empty default tags.
+Tags are server-side application metadata, not additional wire fields.
+
+With the axum feature, extract trusted request headers at reservation:
+
+#+begin_example
+use kal_sse::mux::ConnInfo;
+
+let routes = kal_sse::mux_axum::router_with_tagger(mux.clone(), |headers| {
+    let mut info = ConnInfo::default();
+    if let Some(device) = headers.get("x-trusted-device").and_then(|v| v.to_str().ok()) {
+        info.tags.insert("device".into(), device.into());
+    }
+    info
+});
+#+end_example
+
+The tagger runs only for the reserve request. Stream and channel-change
+requests cannot overwrite the stored tags. ~router(mux)~ is unchanged
+and uses empty tags. Authenticate every route and strip spoofable identity
+headers before this adapter: tags themselves provide no access control.
+
+A family can override
+~open_for(&self, param: Option<&str>, info: &ConnInfo)~ to select or
+construct a caller-specific ~Arc<dyn MuxSource>~. Its default delegates
+to ~open(param)~, preserving existing implementations and closure providers.
+Sources still open lazily, not at reservation: initial channels open on
+stream attachment; later additions open when first polled. Both paths use
+the original reservation's info. A source needing tags beyond this call
+must clone the relevant metadata into its own state.
+
+~Mux::connections() -> Vec<ConnSnapshot>~ lists reservations sorted by
+connection id. Each snapshot contains ~conn~, ~info~, ~channels~ (desired
+keys in insertion order, including loading or refused channels), and
+~attached~. Filter ~attached~ and the channel key to find current followers;
+disconnected reservations remain listed until expiry or release. Expired
+reservations are hidden even before compaction; this read neither reclaims
+handles nor sends notifications. Keep calling ~compact~ periodically.
+
+~Mux::subscribe_connections() -> tokio::sync::watch::Receiver<u64>~ watches
+a revision initially zero. Tokio sync is already a core dependency; no
+runtime or axum feature is required. Subscribe before reading the snapshot,
+then reread it after ~changed().await~. Drop watch borrows before calling
+the mux to avoid blocking writers. Notifications can coalesce, but the
+revision increments once for each successful reserve, effective atomic
+channel-set change, release, stream attach (including supersede),
+authoritative detach/drop, or compaction batch reclaiming expired
+connections. Refused/no-op commands, stale stream cleanup, snapshots,
+deltas, and heartbeats do not notify. Revisions are retained even when
+nobody is subscribed. Expiry is notified when compaction reclaims it,
+not by a background timer.
+
 ** Routes and delivery
 
 The nested routes are =POST /mux= (reserve), =GET /mux/stream?conn=…=

@@ -214,6 +214,56 @@ Releases every channel subscription immediately. Clients SHOULD call it
 on page unload (=navigator.sendBeacon= is acceptable); the TTL covers
 clients that cannot.
 
+* Connection tags and observation
+
+The core stores =ConnInfo { tags: BTreeMap<String, String> }= on each
+reservation. =Mux::reserve_with(channels, info)= supplies this immutable,
+application-defined metadata; =reserve_with_at(channels, info, now)= is
+the explicit-clock variant. =reserve= and =reserve_at= use empty default
+tags. Tags are server-side metadata, not extra wire fields, and the mux
+neither interprets nor authenticates them.
+
+With the axum feature, =mux_axum::router_with_tagger(mux, tagger)= calls
+the tagger with the reservation request's headers to obtain =ConnInfo=.
+It serves the same routes as =router(mux)=, which uses empty tags.
+Stream and channel-change headers cannot replace the original tags.
+The embedding application MUST authenticate its routes and strip
+spoofable identity headers before the adapter; tags do not grant or
+enforce access control.
+
+=MuxFamily::open_for(&self, param, info)= receives the reservation's
+=ConnInfo= when selecting or constructing a source. The default calls
+=open(param)=, preserving existing family implementations and closure
+providers. Initial channels select sources at stream attachment; later
+additions select them when first polled. Neither path opens sources at
+reservation, and both use the original metadata. A source needing tags
+after selection must clone the relevant values into its own state.
+
+=Mux::connections() -> Vec<ConnSnapshot>= returns owned snapshots sorted
+by connection id. Each contains =conn=, =info=, =channels= (desired keys
+in insertion order, including loading or refused channels), and
+=attached= (whether an authoritative stream is attached). Filter by
+=attached= and channel key to list current followers. Disconnected
+reservations remain visible until expiry or release. Expired
+reservations are hidden even before compaction; reading this snapshot
+neither reclaims handles nor publishes a notification.
+
+=Mux::subscribe_connections() -> tokio::sync::watch::Receiver<u64>=
+watches a revision initially zero, without requiring a Tokio runtime or
+the axum feature. Subscribe before reading =connections()=, then reread
+after =changed().await=. Drop watch borrows before calling the mux so
+writers are not blocked. Notifications MAY coalesce; revisions are
+retained even without subscribers.
+
+The revision increments once per successful reserve, effective atomic
+channel-set change, release, stream attach (including supersede),
+authoritative detach/drop, or compaction batch reclaiming expired
+connections. Refused/no-op operations, stale stream cleanup, snapshot
+and delta delivery, and heartbeats do not increment it. Operations
+that call =compact= can additionally notify for an expiry batch.
+Expiry notifications happen on reclamation, not on a background timer;
+applications MUST keep calling =compact= periodically.
+
 * Stream frames
 
 Every frame is one SSE event with a fixed =event:= name and a JSON
